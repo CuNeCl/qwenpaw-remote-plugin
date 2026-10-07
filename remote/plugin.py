@@ -1,12 +1,11 @@
 """Remote SSH Plugin for QwenPaw.
 
-Enables SSH connections to remote devices. When a connection is active
-for a session, all shell commands execute transparently on the remote
-machine via SSH.
+Enables SSH connections to remote devices. When a connection is active for a
+session, all shell commands execute transparently on the remote machine.
 
-Supports both QwenPaw 1.x and 2.0+:
-- 1.x: monkey-patching + ContextVar for session scoping
-- 2.0+: api.register_middleware() + MiddlewareBase
+Targets the QwenPaw 2.0+ plugin API: ``register_middleware`` for the SSH
+interception, ``register_control_command`` for ``/remote``, and
+``register_http_router`` for the management REST API.
 """
 
 import logging
@@ -14,24 +13,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _is_new_api(api) -> bool:
-    """Detect if running on QwenPaw 2.0+ by checking api.register_middleware."""
-    return hasattr(api, "register_middleware")
-
-
 class RemotePlugin:
     """Remote SSH plugin entry point."""
 
     def __init__(self):
         self._api = None
-        self._is_new = False
 
     def register(self, api):
-        """Register tools, hooks, and middleware."""
+        """Register tools, command, middleware, router and hooks."""
         self._api = api
-        self._is_new = _is_new_api(api)
 
-        # Register tools
         from .tools.remote_connect import remote_connect, remote_reconnect
         from .tools.remote_disconnect import remote_disconnect
         from .tools.remote_list import remote_list
@@ -40,7 +31,6 @@ class RemotePlugin:
         from .tools.remote_health import remote_health
         from .tools.remote_set_cwd import remote_set_cwd
         from .tools.remote_sudo import remote_sudo
-        from .tools.remote_command import RemoteCommandHandler
 
         api.register_tool(
             tool_name="remote_connect",
@@ -50,7 +40,7 @@ class RemotePlugin:
                 "all shell commands in this conversation will execute "
                 "on the remote machine."
             ),
-            icon="LinkOutlined",
+            icon="🔗",
             enabled=False,
         )
         api.register_tool(
@@ -60,21 +50,21 @@ class RemotePlugin:
                 "Reconnect to the remote machine using cached connection "
                 "parameters. Use when the previous SSH connection was lost."
             ),
-            icon="ReloadOutlined",
+            icon="🔄",
             enabled=False,
         )
         api.register_tool(
             tool_name="remote_disconnect",
             tool_func=remote_disconnect,
             description="Disconnect from the current remote SSH session.",
-            icon="DisconnectOutlined",
+            icon="🔌",
             enabled=False,
         )
         api.register_tool(
             tool_name="remote_list",
             tool_func=remote_list,
             description="Show the current remote SSH connection status.",
-            icon="CloudOutlined",
+            icon="☁️",
             enabled=False,
         )
         api.register_tool(
@@ -83,7 +73,7 @@ class RemotePlugin:
             description=(
                 "Explicitly execute a command on the remote machine via SSH."
             ),
-            icon="CodeOutlined",
+            icon="💻",
             enabled=False,
         )
         api.register_tool(
@@ -94,7 +84,7 @@ class RemotePlugin:
                 "OS, architecture, kernel, shell, CPU, memory, disk, "
                 "and available development tools."
             ),
-            icon="InfoCircleOutlined",
+            icon="ℹ️",
             enabled=False,
         )
         api.register_tool(
@@ -104,7 +94,7 @@ class RemotePlugin:
                 "Check the health status of the current remote SSH "
                 "connection: status, latency, failures, reconnect availability."
             ),
-            icon="HeartOutlined",
+            icon="❤️",
             enabled=False,
         )
         api.register_tool(
@@ -114,7 +104,7 @@ class RemotePlugin:
                 "Set the default remote working directory for this session. "
                 "All subsequent commands will execute in this directory."
             ),
-            icon="FolderOutlined",
+            icon="📁",
             enabled=False,
         )
         api.register_tool(
@@ -122,69 +112,62 @@ class RemotePlugin:
             tool_func=remote_sudo,
             description=(
                 "Execute a command with sudo privileges on the remote machine. "
-                "Requires sudo password to be configured."
+                "Requires a configured sudo password (POSIX remotes only)."
             ),
-            icon="SafetyOutlined",
+            icon="🛡️",
             enabled=False,
         )
-        api.register_control_command(
-            handler=RemoteCommandHandler(),
-            priority_level=10,
-        )
 
-        # Register middleware - version-dependent
+        self._register_control_command(api)
         self._register_middleware(api)
+        _mount_router(api)
 
-        # Register hooks
-        api.register_startup_hook(
-            hook_name="remote_init",
-            callback=self._on_startup,
-            priority=50,
-        )
         api.register_shutdown_hook(
             hook_name="remote_cleanup",
             callback=self._on_shutdown,
             priority=50,
         )
-        logger.info("[Remote] Plugin registered (api=%s)", "2.0+" if self._is_new else "1.x")
+        logger.info("[Remote] Plugin registered")
+
+    def _register_control_command(self, api):
+        """Register /remote, tolerating host control-command API drift."""
+        try:
+            from .tools.remote_command import RemoteCommandHandler
+        except ImportError as exc:
+            logger.error(
+                "[Remote] /remote command unavailable: the host control "
+                "command API could not be imported (%s). Tools and the SSH "
+                "middleware remain functional.",
+                exc,
+            )
+            return
+
+        try:
+            api.register_control_command(
+                handler=RemoteCommandHandler(),
+                priority_level=10,
+            )
+            logger.info("[Remote] Registered /remote control command")
+        except Exception as exc:
+            logger.error("[Remote] Failed to register /remote command: %s", exc)
 
     def _register_middleware(self, api):
-        """Register SSH middleware using the appropriate API for the version."""
-        if self._is_new:
-            # QwenPaw 2.0+: use api.register_middleware()
-            from .shell_wrapper import make_ssh_middleware_factory
+        """Register the SSH middleware factory (QwenPaw 2.0+ API)."""
+        from .shell_wrapper import make_ssh_middleware_factory
 
-            factory = make_ssh_middleware_factory()
-            if factory is not None:
-                api.register_middleware(
-                    middleware_factory=factory,
-                    priority=50,
-                )
-                logger.info("[Remote] Registered SSH middleware (QwenPaw 2.0+ API)")
-            else:
-                logger.warning("[Remote] Failed to create new middleware factory")
-        else:
-            # QwenPaw 1.x: will be registered via monkey-patching in startup hook
-            logger.info("[Remote] Using legacy middleware (QwenPaw 1.x)")
+        factory = make_ssh_middleware_factory()
+        if factory is None:
+            logger.error(
+                "[Remote] SSH middleware could not be created; shell commands "
+                "will NOT be forwarded to the remote machine"
+            )
+            return
 
-    async def _on_startup(self):
-        """Initialize Remote plugin on application startup."""
-        logger.info("[Remote] Plugin starting up...")
-
-        # Add a version query to the in-memory frontend entry so the
-        # installed plugin keeps a clean manifest but the web loader
-        # fetches a cache-busted bundle.
-        _patch_frontend_entry_cache_buster(self._api)
-
-        # Mount HTTP router (version-dependent)
-        _mount_router(self._api, self._is_new)
-
-        # For QwenPaw 1.x: patch QwenPawAgent to inject middleware and ContextVar
-        if not self._is_new:
-            _patch_create_toolkit()
-            _patch_reply()
-
-        logger.info("[Remote] Plugin startup complete")
+        api.register_middleware(
+            middleware_factory=factory,
+            priority=50,
+        )
+        logger.info("[Remote] Registered SSH middleware")
 
     async def _on_shutdown(self):
         """Cleanup on application shutdown."""
@@ -198,142 +181,17 @@ class RemotePlugin:
             logger.warning("[Remote] Failed to close SSH connections: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# QwenPaw 1.x compatibility: monkey-patching
-# ---------------------------------------------------------------------------
-
-def _patch_frontend_entry_cache_buster(api):
-    """Expose a versioned frontend URL without changing plugin.json.
-
-    NOTE: Uses internal APIs (_registry, _plugin_http_app, plugin_loader).
-    Will silently fail if internal structure changes in future QwenPaw versions.
-    """
-    try:
-        registry = getattr(api, "_registry", None)
-        app = getattr(registry, "_plugin_http_app", None)
-        loader = getattr(getattr(app, "state", None), "plugin_loader", None)
-        if loader is None:
-            logger.warning("[Remote] Plugin loader unavailable for frontend cache busting")
-            return
-
-        record = loader.get_all_loaded_plugins().get("remote")
-        if record is None:
-            logger.warning("[Remote] Plugin record unavailable for frontend cache busting")
-            return
-
-        manifest = record.manifest
-        frontend = manifest.entry.frontend
-        if not frontend:
-            return
-
-        version = manifest.version
-        expected = "ui/dist/index.js"
-        if frontend == expected:
-            manifest.entry.frontend = f"{expected}?v={version}"
-            logger.info(
-                "[Remote] Frontend entry exposed as %s",
-                manifest.entry.frontend,
-            )
-    except Exception as e:
-        logger.warning("[Remote] Failed to add frontend cache buster: %s", e)
-
-
-def _patch_create_toolkit():
-    """Patch QwenPawAgent._create_toolkit to inject SSH middleware (QwenPaw 1.x)."""
-    try:
-        from qwenpaw.agents.react_agent import QwenPawAgent
-    except ImportError as exc:
-        logger.error(
-            "[Remote] Cannot import QwenPawAgent; toolkit patch skipped: %s",
-            exc,
-        )
-        return
-
-    if not hasattr(QwenPawAgent, "_create_toolkit"):
-        logger.warning("[Remote] QwenPawAgent._create_toolkit not found; patch skipped")
-        return
-
-    _original_create_toolkit = QwenPawAgent._create_toolkit
-
-    def _patched_create_toolkit(self, *args, **kwargs):
-        toolkit = _original_create_toolkit(self, *args, **kwargs)
-
-        try:
-            from .shell_wrapper import make_ssh_middleware
-
-            toolkit.register_middleware(make_ssh_middleware())
-            logger.debug("[Remote] SSH middleware registered on toolkit")
-        except Exception as e:
-            logger.warning("[Remote] Failed to register SSH middleware: %s", e)
-
-        return toolkit
-
-    QwenPawAgent._create_toolkit = _patched_create_toolkit
-    logger.info("[Remote] Patched QwenPawAgent._create_toolkit")
-
-
-def _patch_reply():
-    """Patch QwenPawAgent.reply to set the remote_session_id ContextVar (QwenPaw 1.x)."""
-    try:
-        from qwenpaw.agents.react_agent import QwenPawAgent
-    except ImportError as exc:
-        logger.error(
-            "[Remote] Cannot import QwenPawAgent; reply patch skipped: %s",
-            exc,
-        )
-        return
-
-    if not hasattr(QwenPawAgent, "reply"):
-        logger.warning("[Remote] QwenPawAgent.reply not found; patch skipped")
-        return
-
-    _original_reply = QwenPawAgent.reply
-
-    async def _patched_reply(self, msg=None, structured_model=None):
-        from .context import set_remote_session_id
-
-        session_id = (
-            self._request_context.get("session_id")
-            if self._request_context
-            else None
-        )
-        set_remote_session_id(session_id)
-        try:
-            return await _original_reply(self, msg, structured_model)
-        finally:
-            set_remote_session_id(None)
-
-    QwenPawAgent.reply = _patched_reply
-    logger.info("[Remote] Patched QwenPawAgent.reply")
-
-
-def _mount_router(api, is_new: bool):
-    """Mount the HTTP router for connection management API.
-
-    Args:
-        api: PluginApi instance
-        is_new: True if running on QwenPaw 2.0+
-    """
+def _mount_router(api):
+    """Mount the management REST API at ``/api/remote``."""
     try:
         from .routers.connections import router
 
-        if is_new:
-            # QwenPaw 2.0+: use api.register_http_router()
-            api.register_http_router(
-                router=router,
-                prefix="/remote",
-            )
-        else:
-            # QwenPaw 1.x: use PluginRegistry directly
-            from qwenpaw.plugins.registry import PluginRegistry
-
-            registry = PluginRegistry()
-            registry.register_http_router(
-                plugin_id="remote",
-                router=router,
-                prefix="/remote",
-            )
-        logger.info("[Remote] HTTP router mounted at /remote (API: /remote/*)")
+        api.register_http_router(
+            router=router,
+            prefix="/remote",
+            tags=["remote"],
+        )
+        logger.info("[Remote] HTTP router mounted at /api/remote")
     except Exception as e:
         logger.error("[Remote] Failed to mount HTTP router: %s", e)
 

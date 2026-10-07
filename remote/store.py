@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -11,6 +12,10 @@ from qwenpaw.constant import WORKING_DIR
 
 _REMOTE_DIR = WORKING_DIR / "remote"
 _PROFILES_FILE = _REMOTE_DIR / "profiles.json"
+#: Host keys the user explicitly trusted through ``accept_new_host_key``.
+#: Written in OpenSSH known_hosts format so later connections verify against
+#: them instead of disabling verification.
+KNOWN_HOSTS_FILE = _REMOTE_DIR / "known_hosts"
 
 
 def _load_profiles_file() -> dict[str, Any]:
@@ -23,11 +28,20 @@ def _load_profiles_file() -> dict[str, Any]:
 
 
 def _save_profiles_file(data: dict[str, Any]) -> None:
+    """Write the store atomically, restricting permissions where possible.
+
+    The file holds SSH passwords and passphrases, so it is written to a
+    temporary sibling (mode 0600) and then atomically renamed into place.
+    """
     _REMOTE_DIR.mkdir(parents=True, exist_ok=True)
-    _PROFILES_FILE.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    tmp_path = _PROFILES_FILE.with_name(_PROFILES_FILE.name + ".tmp")
+    tmp_path.write_text(payload, encoding="utf-8")
+    try:
+        os.chmod(tmp_path, 0o600)
+    except OSError:  # pragma: no cover - Windows / non-POSIX filesystems
+        pass
+    os.replace(tmp_path, _PROFILES_FILE)
 
 
 def list_profiles() -> list[dict[str, Any]]:
@@ -101,14 +115,44 @@ def _normalize_profile_payload(
     )
     profile["jump_host_id"] = str(payload.get("jump_host_id", "")).strip()
     profile["default_cwd"] = str(payload.get("default_cwd", "")).strip()
+    profile["accept_new_host_key"] = bool(payload.get("accept_new_host_key", False))
+    profile["sudo_password"] = str(payload.get("sudo_password", ""))
 
     if existing is not None:
-        if not profile["password"]:
-            profile["password"] = str(existing.get("password", ""))
-        if not profile["passphrase"]:
-            profile["passphrase"] = str(existing.get("passphrase", ""))
+        for secret in ("password", "passphrase", "sudo_password"):
+            if not profile[secret]:
+                profile[secret] = str(existing.get(secret, ""))
 
     return profile
+
+
+def update_profile_cwd(profile_id: str, cwd: str) -> dict[str, Any] | None:
+    """Update the default working directory of a profile.
+
+    Deliberately narrow: a profile update replaces every field, so routing a
+    cwd-only change through :func:`update_profile` would reset host,
+    username, key path and jump host to their defaults.
+    """
+    data = _load_profiles_file()
+    profiles = list_profiles()
+
+    updated_profile = None
+    for index, profile in enumerate(profiles):
+        if profile.get("id") != profile_id:
+            continue
+
+        merged = dict(profile)
+        merged["default_cwd"] = cwd.strip()
+        profiles[index] = merged
+        updated_profile = merged
+        break
+
+    if updated_profile is None:
+        return None
+
+    data["profiles"] = profiles
+    _save_profiles_file(data)
+    return updated_profile
 
 
 def create_jump_host(payload: dict[str, Any]) -> dict[str, Any]:

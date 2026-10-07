@@ -37,6 +37,13 @@ class ConnectRequest(BaseModel):
     default_cwd: str = Field(
         default="", description="Default remote working directory"
     )
+    accept_new_host_key: bool = Field(
+        default=False,
+        description=(
+            "Trust an unknown remote host key on first connect. "
+            "Disabled by default to prevent man-in-the-middle attacks."
+        ),
+    )
 
 
 class ProfileRequest(BaseModel):
@@ -53,9 +60,23 @@ class ProfileRequest(BaseModel):
     passphrase: str = Field(
         default="", description="Passphrase for the private key"
     )
+    sudo_password: str = Field(
+        default="",
+        description=(
+            "Password used only for sudo. Never reuses the SSH login "
+            "password. Leave empty to keep the stored value."
+        ),
+    )
     jump_host_id: str = Field(default="", description="Saved jump host ID")
     default_cwd: str = Field(
         default="", description="Default remote working directory"
+    )
+    accept_new_host_key: bool = Field(
+        default=False,
+        description=(
+            "Trust an unknown remote host key on first connect. "
+            "Disabled by default to prevent man-in-the-middle attacks."
+        ),
     )
 
 
@@ -121,6 +142,10 @@ class ProfileTestRequest(BaseModel):
     )
     jump_passphrase: str = Field(
         default="", description="Jump host key passphrase"
+    )
+    accept_new_host_key: bool = Field(
+        default=False,
+        description="Trust an unknown remote host key on first connect.",
     )
 
 

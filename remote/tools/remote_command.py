@@ -1,23 +1,17 @@
-"""Control command handler for /remote."""
+"""Control command handler for /remote (QwenPaw 2.0+)."""
 
 from __future__ import annotations
 
 import shlex
 
-# QwenPaw 2.0+ uses runtime.commands.control (source build).
-# QwenPaw 1.x / Desktop frozen build uses app.runner.control_commands.
-try:
-    from qwenpaw.runtime.commands.control import (
-        BaseControlCommandHandler,
-        ControlContext,
-    )
-except ImportError:
-    from qwenpaw.app.runner.control_commands import (  # type: ignore[no-redef]
-        BaseControlCommandHandler,
-        ControlContext,
-    )
+from agentscope.message import Msg
+from qwenpaw.runtime.commands.control.base import BaseControlCommandHandler
 
 from ..ssh_manager import get_ssh_manager
+
+
+def _as_bool(value: str) -> bool:
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 class RemoteCommandHandler(BaseControlCommandHandler):
@@ -29,19 +23,42 @@ class RemoteCommandHandler(BaseControlCommandHandler):
     - /remote connect host=192.168.0.10 username=root password=...
     - /remote connect root@192.168.0.10 password=...
     - /remote disconnect
-    - /remote pwd
+    - /remote reconnect
+    - /remote cd /workspace/app
+    - /remote sudo systemctl restart nginx
+    - /remote set-sudo <password>
     - /remote exec pwd
     - /remote run pwd
     - /remote 执行pwd
     """
 
-    command_name = "/remote"
+    command_name = "remote"
+    help_text = (
+        "Manage the current remote SSH session and execute commands on the "
+        "remote machine"
+    )
 
-    async def handle(self, context: ControlContext) -> str:
-        raw_args = context.args.get("_raw_args", "").strip()
+    async def handle(self, ctx, args: str):
+        """Entry point invoked by the QwenPaw control command dispatcher."""
+        session_id = str(getattr(ctx, "session_id", "") or "")
+        raw_args = (args or "").strip()
 
+        if not session_id:
+            return Msg(
+                name="system",
+                role="assistant",
+                content=(
+                    "Remote SSH commands are session scoped, but the host did "
+                    "not provide a session id for this command."
+                ),
+            )
+
+        text = await self._dispatch(session_id, raw_args)
+        return Msg(name="system", role="assistant", content=text)
+
+    async def _dispatch(self, session_id: str, raw_args: str) -> str:
         if not raw_args or raw_args.lower() in ("status", "list", "ls"):
-            return self._format_status(context.session_id)
+            return self._format_status(session_id)
 
         lowered = raw_args.lower()
         if lowered in ("help", "-h", "--help"):
@@ -49,29 +66,30 @@ class RemoteCommandHandler(BaseControlCommandHandler):
 
         if lowered.startswith("connect"):
             return await self._connect(
-                context.session_id,
-                raw_args[len("connect") :].strip(),
+                session_id,
+                raw_args[len("connect"):].strip(),
             )
 
         if lowered in ("disconnect", "close", "off"):
-            return await self._disconnect(context.session_id)
+            return await self._disconnect(session_id)
 
         if lowered in ("reconnect", "reconn"):
-            return await self._reconnect(context.session_id)
+            return await self._reconnect(session_id)
 
         if lowered.startswith("cd "):
-            return await self._cd(context.session_id, raw_args[3:].strip())
-
-        if lowered.startswith("sudo "):
-            return await self._sudo(context.session_id, raw_args[5:].strip())
+            return await self._cd(session_id, raw_args[3:].strip())
 
         if lowered.startswith("set-sudo ") or lowered.startswith("setsudo "):
-            return await self._set_sudo(context.session_id, raw_args.split(" ", 1)[1].strip() if " " in raw_args else "")
+            password = raw_args.split(" ", 1)[1].strip() if " " in raw_args else ""
+            return await self._set_sudo(session_id, password)
+
+        if lowered.startswith("sudo "):
+            return await self._sudo(session_id, raw_args[5:].strip())
 
         command = self._extract_command(raw_args)
         if not command:
             return self._help()
-        return await self._exec(context.session_id, command)
+        return await self._exec(session_id, command)
 
     async def _connect(self, session_id: str, args: str) -> str:
         parsed = self._parse_args(args)
@@ -88,11 +106,17 @@ class RemoteCommandHandler(BaseControlCommandHandler):
         try:
             port = int(parsed.get("port", "22"))
         except ValueError:
-            return "Invalid port. Example: `/remote connect host=192.168.0.10 username=root port=22`"
+            return (
+                "Invalid port. Example: "
+                "`/remote connect host=192.168.0.10 username=root port=22`"
+            )
         try:
             jump_port = int(parsed.get("jump_port", "22"))
         except ValueError:
-            return "Invalid jump_port. Example: `/remote connect root@10.0.0.5 jump_host=1.2.3.4 jump_username=jump jump_port=22`"
+            return (
+                "Invalid jump_port. Example: `/remote connect root@10.0.0.5 "
+                "jump_host=1.2.3.4 jump_username=jump jump_port=22`"
+            )
 
         if not host or not username:
             return (
@@ -119,6 +143,9 @@ class RemoteCommandHandler(BaseControlCommandHandler):
                 jump_password=parsed.get("jump_password", ""),
                 jump_key_path=parsed.get("jump_key_path", ""),
                 jump_passphrase=parsed.get("jump_passphrase", ""),
+                accept_new_host_key=_as_bool(
+                    parsed.get("accept_new_host_key", "")
+                ),
             )
         except (ConnectionError, ValueError) as exc:
             return f"Remote connection failed: {exc}"
@@ -133,8 +160,8 @@ class RemoteCommandHandler(BaseControlCommandHandler):
 
         return (
             f"Connected to {info['username']}@{info['host']}:{info['port']}."
-            f"{via}\nUse `/remote <command>` to run commands on the remote machine, "
-            "or `/remote disconnect` to close the connection."
+            f"{via}\nUse `/remote <command>` to run commands on the remote "
+            "machine, or `/remote disconnect` to close the connection."
         )
 
     async def _disconnect(self, session_id: str) -> str:
@@ -179,9 +206,7 @@ class RemoteCommandHandler(BaseControlCommandHandler):
                 cwd=path,
                 verify=True,
             )
-        except ValueError as exc:
-            return f"Failed: {exc}"
-        except ConnectionError as exc:
+        except (ValueError, ConnectionError) as exc:
             return f"Failed: {exc}"
 
         return f"Working directory set to: {result['default_cwd']}"
@@ -200,18 +225,7 @@ class RemoteCommandHandler(BaseControlCommandHandler):
         except ConnectionError as exc:
             return f"Sudo command failed: {exc}"
 
-        prefix = "[sudo]"
-        parts = [prefix, f"$ {command}"]
-        if stdout:
-            parts.append(stdout.rstrip())
-        if stderr:
-            parts.append("[stderr]")
-            parts.append(stderr.rstrip())
-        if returncode != 0:
-            parts.append(f"[exit code: {returncode}]")
-        if len(parts) == 2:
-            parts.append("Command executed successfully (no output).")
-        return "\n".join(parts)
+        return self._format_result("[sudo]", command, returncode, stdout, stderr)
 
     async def _set_sudo(self, session_id: str, password: str) -> str:
         if not password:
@@ -220,12 +234,13 @@ class RemoteCommandHandler(BaseControlCommandHandler):
         manager = get_ssh_manager()
         manager.set_sudo(session_id, password, enabled=True)
 
-        # Verify sudo
         result = await manager.verify_sudo(session_id)
         if result.get("ok"):
             return f"Sudo configured and verified at {result['verified_at']}."
-        else:
-            return f"Sudo configured but verification failed: {result.get('error', 'unknown error')}"
+        return (
+            "Sudo configured but verification failed: "
+            f"{result.get('error', 'unknown error')}"
+        )
 
     async def _exec(self, session_id: str, command: str) -> str:
         manager = get_ssh_manager()
@@ -245,6 +260,16 @@ class RemoteCommandHandler(BaseControlCommandHandler):
             return f"Remote command failed: {exc}"
 
         prefix = f"[remote: {conn.username}@{conn.host}]"
+        return self._format_result(prefix, command, returncode, stdout, stderr)
+
+    @staticmethod
+    def _format_result(
+        prefix: str,
+        command: str,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+    ) -> str:
         parts = [prefix, f"$ {command}"]
         if stdout:
             parts.append(stdout.rstrip())
@@ -265,7 +290,10 @@ class RemoteCommandHandler(BaseControlCommandHandler):
         if conn is None:
             reconnect_hint = ""
             if health.get("reconnect_available"):
-                reconnect_hint = "\nReconnect available. Use `/remote reconnect` or the reconnect button."
+                reconnect_hint = (
+                    "\nReconnect available. Use `/remote reconnect` or the "
+                    "reconnect button."
+                )
             return (
                 "No active SSH connection for this session.\n"
                 f"{reconnect_hint}\n\n"
@@ -288,12 +316,16 @@ class RemoteCommandHandler(BaseControlCommandHandler):
             health_lines += f"- Latency: {latency:.0f} ms\n"
         cwd_ok = health.get("cwd_ok")
         if cwd_ok is not None:
-            health_lines += f"- Remote directory: {'accessible' if cwd_ok else 'inaccessible'}\n"
+            health_lines += (
+                f"- Remote directory: "
+                f"{'accessible' if cwd_ok else 'inaccessible'}\n"
+            )
 
         return (
             "Active SSH connection:\n"
             f"- Host: {info['username']}@{info['host']}:{info['port']}\n"
             f"- Status: {status}\n"
+            f"- Platform: {info.get('os_family', 'posix')}\n"
             f"{via}"
             f"{health_lines}"
             f"- Connected at: {info['connected_at']}\n"
@@ -306,9 +338,9 @@ class RemoteCommandHandler(BaseControlCommandHandler):
         lowered = text.lower()
         for prefix in ("exec ", "run "):
             if lowered.startswith(prefix):
-                return text[len(prefix) :].strip()
+                return text[len(prefix):].strip()
         if text.startswith("执行"):
-            return text[len("执行") :].strip()
+            return text[len("执行"):].strip()
         return text
 
     @staticmethod
@@ -318,7 +350,7 @@ class RemoteCommandHandler(BaseControlCommandHandler):
         except ValueError:
             tokens = args.split()
 
-        result = {"positional": []}
+        result: dict = {"positional": []}
         for token in tokens:
             if "=" in token:
                 key, value = token.split("=", 1)
@@ -336,6 +368,7 @@ class RemoteCommandHandler(BaseControlCommandHandler):
             "`/remote connect <user>@<host> key_path=<path>` - Connect with SSH key\n"
             "`/remote connect <user>@<host> jump_name=<name>` - Connect through a saved jump host\n"
             "`/remote connect <user>@<host> jump_host=<host> jump_username=<user>` - Connect through an inline jump host\n"
+            "`/remote connect <user>@<host> accept_new_host_key=true` - Trust an unknown host key\n"
             "`/remote disconnect` - Disconnect current session\n"
             "`/remote reconnect` - Reconnect using cached parameters\n"
             "`/remote cd <path>` - Set default working directory\n"

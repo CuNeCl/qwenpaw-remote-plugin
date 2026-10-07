@@ -11,6 +11,15 @@
 declare const __REMOTE_PLUGIN_VERSION__: string;
 
 const REMOTE_PLUGIN_BUILD_ID = __REMOTE_PLUGIN_VERSION__;
+const REMOTE_PLUGIN_ID = "remote";
+
+/**
+ * Last session id the host handed to a chat request transform.
+ *
+ * Some host builds expose neither `host.getCurrentSessionId()` nor a session
+ * global, but they do pass `sessionId` to `chat.requestPayload` transforms.
+ */
+let cachedSessionId: string | null = null;
 
 function buildPlugin() {
   const runtime = window as any;
@@ -18,8 +27,9 @@ function buildPlugin() {
   runtime.__remotePluginInitialized = true;
   runtime.__remotePluginInitializedBuild = REMOTE_PLUGIN_BUILD_ID;
 
-  const { React, antd, antdIcons, getApiUrl, getApiToken } = (window as any)
-    .QwenPaw.host;
+  const host = runtime.QwenPaw.host;
+  const qwenpaw = runtime.QwenPaw;
+  const { React, antd, antdIcons } = host;
   const {
     Card,
     Tag,
@@ -63,75 +73,10 @@ function buildPlugin() {
 
   // ── Language Detection ─────────────────────────────────────────────
 
-  function isChinese(): boolean {
-    try {
-      const qwenpaw = (window as any).QwenPaw || {};
-      const host = qwenpaw.host || {};
-      const readMaybeFunction = (value: any) =>
-        typeof value === "function" ? value() : value;
-      const storageLang = (() => {
-        try {
-          const stores = [window.localStorage, window.sessionStorage];
-          for (const store of stores) {
-            for (let i = 0; i < store.length; i += 1) {
-              const key = store.key(i) || "";
-              if (!/(locale|language|lang)/i.test(key)) continue;
-              const value = store.getItem(key) || "";
-              if (/^zh/i.test(value) || /"zh/i.test(value)) return value;
-            }
-          }
-        } catch {
-          return "";
-        }
-        return "";
-      })();
-      const lang =
-        readMaybeFunction(host.getLocale) ||
-        readMaybeFunction(host.getLanguage) ||
-        host.locale ||
-        host.language ||
-        host.lang ||
-        host.settings?.locale ||
-        host.settings?.language ||
-        host.config?.locale ||
-        host.config?.language ||
-        host.i18n?.locale ||
-        host.i18n?.language ||
-        qwenpaw.locale ||
-        qwenpaw.language ||
-        qwenpaw.lang ||
-        qwenpaw.settings?.locale ||
-        qwenpaw.settings?.language ||
-        qwenpaw.config?.locale ||
-        qwenpaw.config?.language ||
-        qwenpaw.i18n?.locale ||
-        qwenpaw.i18n?.language ||
-        storageLang ||
-        document.documentElement.lang ||
-        "";
-      return String(lang).toLowerCase().startsWith("zh");
-    } catch {
-      return false;
-    }
-  }
-
   function useZh(): boolean {
-    const [zh, setZh] = useState(isChinese());
-
-    useEffect(() => {
-      const syncLanguage = () => setZh(isChinese());
-      syncLanguage();
-      const interval = window.setInterval(syncLanguage, 1000);
-      window.addEventListener("languagechange", syncLanguage);
-      window.addEventListener("storage", syncLanguage);
-      return () => {
-        window.clearInterval(interval);
-        window.removeEventListener("languagechange", syncLanguage);
-        window.removeEventListener("storage", syncLanguage);
-      };
-    }, []);
-
-    return zh;
+    // `useLocale` is the documented host hook ("zh" | "en").
+    const locale = typeof host.useLocale === "function" ? host.useLocale() : "";
+    return String(locale).toLowerCase().startsWith("zh");
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────
@@ -141,50 +86,304 @@ function buildPlugin() {
     return React.createElement("span", null, fallback);
   }
 
+  /**
+   * Unwrap the various shapes a tool result can arrive in.
+   *
+   * `chat.toolRender` hands the renderer `React.FC<Record<string, unknown>>`,
+   * so the payload may be the raw string, a tool-call object, or a wrapper
+   * such as `{ result }` / `{ output }` / `{ data }`.
+   */
+  function normalizeToolData(data: any): any {
+    let value = data;
+    const seen = new Set<any>();
+    while (
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      !seen.has(value)
+    ) {
+      seen.add(value);
+      if (value.result !== undefined) {
+        value = value.result;
+        continue;
+      }
+      if (value.toolResult !== undefined) {
+        value = value.toolResult;
+        continue;
+      }
+      if (value.output !== undefined) {
+        value = value.output;
+        continue;
+      }
+      // Do not unwrap a ToolResponse-like payload that carries `content`.
+      if (value.data !== undefined && !("content" in value)) {
+        value = value.data;
+        continue;
+      }
+      break;
+    }
+    return value;
+  }
+
+  let toolShapeLogged = false;
+
+  /** Log the real prop shape once, so future mismatches are diagnosable. */
+  function logToolShape(props: any, toolName: string, extracted: string) {
+    if (toolShapeLogged) return;
+    toolShapeLogged = true;
+    console.debug(
+      "[Remote] toolRender props for",
+      toolName,
+      props,
+      "keys:",
+      props && typeof props === "object" ? Object.keys(props) : typeof props,
+      "extracted:",
+      extracted.slice(0, 300),
+    );
+  }
+
   function parseToolArgs(data: any): Record<string, any> {
-    const firstData = data?.content?.[0]?.data;
-    const rawArgs = firstData?.arguments;
-    if (typeof rawArgs === "string") {
-      try {
-        return JSON.parse(rawArgs);
-      } catch {
-        return {};
+    const value = normalizeToolData(data);
+    const content0 = Array.isArray(value?.content) ? value.content[0] : null;
+    const candidates = [
+      value?.arguments,
+      value?.input,
+      value?.args,
+      content0?.arguments,
+      content0?.input,
+      content0?.data?.arguments,
+    ];
+
+    for (const candidate of candidates) {
+      if (candidate === undefined || candidate === null || candidate === "") {
+        continue;
+      }
+      if (typeof candidate === "string") {
+        try {
+          return JSON.parse(candidate);
+        } catch {
+          continue;
+        }
+      }
+      if (typeof candidate === "object") return candidate;
+    }
+    return {};
+  }
+
+  const TOOL_OUTPUT_KEYS = ["text", "output", "result", "stdout", "message", "value"];
+  const TOOL_OUTPUT_CONTAINERS = ["content", "data", "blocks", "toolResult"];
+
+  /** True for a block that carries the tool CALL (arguments), not its result. */
+  function isToolCallRecord(node: any): boolean {
+    if (!node || typeof node !== "object" || Array.isArray(node)) return false;
+    const hasArgs = "arguments" in node || "call_id" in node;
+    const hasOutput = TOOL_OUTPUT_KEYS.some((key) => key in node);
+    return hasArgs && !hasOutput;
+  }
+
+  /**
+   * Depth-first search for the tool's output text.
+   *
+   * The host hands over a Msg-like payload (`plugin_call_output`) whose
+   * content mixes the call record with the result, and the exact key varies
+   * between host builds — so known keys are tried first and the longest
+   * non-argument string is used as a last resort.
+   */
+  function deepFindOutput(
+    node: any,
+    depth = 0,
+    seen = new Set<any>(),
+    longest = { value: "" },
+  ): string {
+    if (node === null || node === undefined || depth > 8) return "";
+    if (typeof node === "string") return node;
+    if (typeof node === "number" || typeof node === "boolean") return String(node);
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const found = deepFindOutput(item, depth + 1, seen, longest);
+        if (found) return found;
+      }
+      return "";
+    }
+    if (typeof node !== "object") return "";
+    if (seen.has(node)) return "";
+    seen.add(node);
+    if (isToolCallRecord(node)) return "";
+
+    for (const key of TOOL_OUTPUT_KEYS) {
+      const child = node[key];
+      if (child === undefined || child === null) continue;
+      const found = deepFindOutput(child, depth + 1, seen, longest);
+      if (found) return found;
+    }
+    for (const key of TOOL_OUTPUT_CONTAINERS) {
+      const child = node[key];
+      if (child === undefined || child === null) continue;
+      const found = deepFindOutput(child, depth + 1, seen, longest);
+      if (found) return found;
+    }
+
+    // Last resort: remember the longest string that is not a tool argument.
+    for (const value of Object.values(node)) {
+      if (typeof value === "string" && value.length > longest.value.length) {
+        longest.value = value;
       }
     }
-    return rawArgs ?? {};
+    return "";
   }
 
+  /** Full output text of a tool result, whatever shape it arrives in. */
   function parseToolOutput(data: any): string {
-    const content = data?.content;
-    if (!content || !Array.isArray(content)) return "";
-    return content
-      .filter((c: any) => c.type === "text")
-      .map((c: any) => c.text || "")
-      .join("\n");
+    const value = normalizeToolData(data);
+    if (value === undefined || value === null) return "";
+
+    const found = deepFindOutput(value);
+    if (found) return found;
+    if (typeof value === "string") return value;
+
+    const longest = { value: "" };
+    deepFindOutput(value, 0, new Set<any>(), longest);
+    if (longest.value) return longest.value;
+
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
   }
 
-  function getSessionId(): string {
-    try {
-      const sid = (window as any).currentSessionId ||
-                  (window as any).sessionId ||
-                  localStorage?.getItem?.("sessionId");
-      if (sid) return sid;
-    } catch (e) {
-      console.debug("[Remote] Error getting sessionId:", e);
+  function getSessionId(): string | null {
+    // Documented host getter first, then the globals older hosts expose, then
+    // the id captured from chat request payloads.
+    const hostSession =
+      typeof host.getCurrentSessionId === "function"
+        ? host.getCurrentSessionId()
+        : null;
+    if (hostSession) return String(hostSession);
+
+    const runtime = window as any;
+    const legacy = runtime.currentSessionId || runtime.sessionId;
+    if (legacy) return String(legacy);
+
+    // No session is a normal state on pages without an open chat. The plugin
+    // must never invent a shared fallback id, because that would let
+    // unrelated sessions share (and disconnect) one SSH connection.
+    return cachedSessionId;
+  }
+
+  /**
+   * Session id for user-initiated actions.
+   *
+   * Reports once when unavailable; polling loops must use getSessionId()
+   * directly so a missing session cannot flood the UI with errors.
+   */
+  function requireSessionId(
+    zh: boolean,
+    resolved?: string | null,
+  ): string | null {
+    const sessionId = resolved ?? getSessionId();
+    if (!sessionId) {
+      antdMessage.error(
+        zh
+          ? "当前没有打开的会话，请先进入一个对话再操作。"
+          : "No active chat session. Open a chat first.",
+      );
     }
-    return "default-session";
+    return sessionId;
+  }
+
+  /** True when the backend refused an untrusted or mismatched host key. */
+  function isHostKeyError(message: string): boolean {
+    return /known_hosts|host key/i.test(message);
+  }
+
+  /**
+   * Ask the backend which SSH connection belongs to this caller.
+   *
+   * The Remote SSH settings route has no "current session", so this
+   * owner-scoped lookup is how the UI learns both the connection and the
+   * session id it needs for later scoped calls.
+   */
+  async function fetchActiveConnection(): Promise<any | null> {
+    try {
+      const data = await apiFetch("/remote/connections/active");
+      const sessionId = data?.session_id ? String(data.session_id) : null;
+      if (sessionId) cachedSessionId = sessionId;
+      return data;
+    } catch (e) {
+      console.debug("[Remote] Active connection lookup failed:", e);
+      return null;
+    }
+  }
+
+  /**
+   * Connect through a saved profile.
+   *
+   * On an untrusted host key the offer to trust it once is shown and the
+   * attempt is repeated with an explicit override; the key is then recorded in
+   * the plugin's known_hosts so later connections stay strictly verified.
+   */
+  async function connectViaProfile(
+    profileId: string,
+    sessionId: string,
+    zh: boolean,
+  ) {
+    const body: Record<string, unknown> = { session_id: sessionId };
+    try {
+      return await apiFetch(`/remote/profiles/${profileId}/connect`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    } catch (e: any) {
+      const message = e?.message || String(e);
+      // A key *mismatch* is never auto-trusted: it needs manual verification.
+      if (!isHostKeyError(message) || /mismatch/i.test(message)) throw e;
+      const trust = await new Promise<boolean>((resolve) => {
+        Modal.confirm({
+          title: zh ? "主机密钥未受信任" : "Untrusted host key",
+          content: zh
+            ? "该主机的密钥不在 known_hosts 中。请先用带外方式核对主机指纹（例如 ssh-keyscan）。确认信任后，密钥会记入插件自己的 known_hosts，之后的连接仍会严格校验。"
+            : "This host key is not in known_hosts. Verify the fingerprint out of band first (for example with ssh-keyscan). Once trusted, the key is stored in the plugin's known_hosts and later connections stay strictly verified.",
+          okText: zh ? "信任并重试" : "Trust and retry",
+          cancelText: zh ? "取消" : "Cancel",
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        });
+      });
+      if (!trust) throw e;
+      return apiFetch(`/remote/profiles/${profileId}/connect`, {
+        method: "POST",
+        body: JSON.stringify({ ...body, accept_new_host_key: true }),
+      });
+    }
   }
 
   async function apiFetch(path: string, options: RequestInit = {}) {
-    const token = getApiToken();
+    // The request is built explicitly instead of using host.fetch: some host
+    // builds ignore options.method and silently send every call as GET,
+    // which turns POST/PATCH into list endpoints or 405 responses.
+    const url =
+      typeof host.getApiUrl === "function" ? host.getApiUrl(path) : path;
+    const token =
+      typeof host.getApiToken === "function" ? host.getApiToken() : null;
+    const agentId =
+      typeof host.getSelectedAgentId === "function"
+        ? host.getSelectedAgentId()
+        : null;
+
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      // The backend uses this to enforce per-caller session ownership.
+      ...(agentId ? { "X-Agent-Id": String(agentId) } : {}),
       ...((options.headers as Record<string, string>) || {}),
     };
-    const res = await fetch(getApiUrl(path), { ...options, headers });
+
+    const method = options.method || "GET";
+    const res = await fetch(url, { ...options, method, headers });
     if (!res.ok) {
       const body = await res.text();
+      console.debug("[Remote] API error", method, url, res.status, body);
       throw new Error(`${res.status}: ${body}`);
     }
     return res.json();
@@ -216,6 +415,51 @@ function buildPlugin() {
   };
 
   // ── Tool Renderers ──────────────────────────────────────────────────
+
+  /**
+   * Wraps a tool card so its body is collapsed by default; the user expands
+   * what they need. Content that already fits stays uncropped and shows no
+   * toggle.
+   */
+  function CollapsibleToolBody({ children }: { children: any }) {
+    const [open, setOpen] = useState(false);
+    const [overflows, setOverflows] = useState(false);
+    const bodyRef = React.useRef(null as any);
+
+    // `scrollHeight` measures the full content even while clamped.
+    useEffect(() => {
+      const element = bodyRef.current;
+      if (element) setOverflows(element.scrollHeight > 132);
+    }, [open]);
+
+    return React.createElement(
+      "div",
+      null,
+      React.createElement(
+        "div",
+        {
+          ref: bodyRef,
+          style: {
+            maxHeight: open || !overflows ? undefined : 120,
+            overflow: open || !overflows ? undefined : "hidden",
+          },
+        },
+        children,
+      ),
+      overflows
+        ? React.createElement(
+            Button,
+            {
+              type: "link",
+              size: "small",
+              style: { padding: 0, height: "auto", fontSize: 12 },
+              onClick: () => setOpen(!open),
+            },
+            open ? "收起 / Collapse" : "展开 / Expand",
+          )
+        : null,
+    );
+  }
 
   function RemoteConnectRender({ data }: { data: any }) {
     const output = parseToolOutput(data);
@@ -354,14 +598,25 @@ function buildPlugin() {
           null,
           React.createElement(CodeOutlined || ">_"),
           React.createElement(Text, { strong: true }, "Remote Command"),
-          args.command
-            ? React.createElement(
-                Text,
-                { code: true, ellipsis: true, style: { maxWidth: 400 } },
-                args.command,
-              )
-            : null,
         ),
+        args.command
+          ? React.createElement(
+              "pre",
+              {
+                style: {
+                  margin: 0,
+                  padding: "6px 8px",
+                  background: "rgba(0,0,0,0.03)",
+                  border: "1px solid rgba(0,0,0,0.06)",
+                  borderRadius: 4,
+                  fontSize: 12,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-all",
+                },
+              },
+              `$ ${args.command}`,
+            )
+          : null,
         React.createElement(
           "pre",
           {
@@ -532,43 +787,39 @@ function buildPlugin() {
     const [form] = Form.useForm();
     const [jumpForm] = Form.useForm();
 
+    // Populated from the owner-scoped active-connection lookup; the settings
+    // route cannot ask the host for a "current session".
+    const [sessionId, setSessionId] = useState(getSessionId() || "");
+    const [pendingProfileId, setPendingProfileId] = useState("");
+
     const fetchData = useCallback(async () => {
       setLoading(true);
       setError("");
       try {
-        const sessionId = getSessionId() || "";
-        const encodedSessionId = encodeURIComponent(sessionId);
-        const profileUrl = `/remote/profiles?session_id=${encodedSessionId}`;
-        const jumpUrl = `/remote/jump-hosts`;
-        const connectionUrl = `/remote/connections?session_id=${encodedSessionId}`;
-
-        console.log("[Remote] Fetching data from:", profileUrl, jumpUrl);
-        const [profileData, jumpHostData, connectionData] = await Promise.all([
-          apiFetch(profileUrl),
-          apiFetch(jumpUrl),
-          apiFetch(connectionUrl).catch(() => ({ connections: [] })),
+        // Profiles and jump hosts are host-level configuration. The active
+        // connection lookup supplies both the "connected" badge and the
+        // session id used by later scoped calls.
+        const [active, profileData, jumpHostData] = await Promise.all([
+          fetchActiveConnection(),
+          apiFetch("/remote/profiles"),
+          apiFetch("/remote/jump-hosts"),
         ]);
-        console.log("[Remote] Profiles data:", profileData);
-        console.log("[Remote] Jump hosts data:", jumpHostData);
-        const nextProfiles = profileData.profiles || [];
-        const nextActiveProfileId = profileData.active_profile_id || "";
-        const activeProfile = nextProfiles.find(
-          (profile: any) => profile.id === nextActiveProfileId,
+        const activeConnection = active?.connection || null;
+        setSessionId(
+          active?.session_id
+            ? String(active.session_id)
+            : getSessionId() || "",
         );
-        const activeConnection = (connectionData.connections || [])[0] || null;
-        setProfiles(nextProfiles);
-        setActiveProfileId(nextActiveProfileId);
+        setProfiles(profileData.profiles || []);
+        setActiveProfileId(activeConnection?.profile_id || "");
+        setPendingProfileId(active?.pending_profile_id || "");
         setJumpHosts(jumpHostData.jump_hosts || []);
-        setCwdValue(
-          activeConnection?.default_cwd ||
-            activeProfile?.default_cwd ||
-            "/",
-        );
+        setCwdValue(activeConnection?.default_cwd || "/");
       } catch (e: any) {
         const errMsg = e.message || String(e);
         console.error("[Remote] Failed to fetch data:", e);
+        // Inline only: this runs on a polling interval, so it must not toast.
         setError(errMsg);
-        antdMessage.error(`Failed to load profiles: ${errMsg}`);
       } finally {
         setLoading(false);
       }
@@ -624,8 +875,10 @@ function buildPlugin() {
         password: "",
         key_path: profile.key_path,
         passphrase: "",
+        sudo_password: "",
         jump_host_id: profile.jump_host_id || "",
         default_cwd: profile.default_cwd || "",
+        accept_new_host_key: Boolean(profile.accept_new_host_key),
       });
       setModalOpen(true);
     };
@@ -689,18 +942,12 @@ function buildPlugin() {
     };
 
     const handleToggleConnect = async (profile: any) => {
-      const sessionId = getSessionId();
-      if (!sessionId) {
-        antdMessage.error("No active session. Open a chat first.");
-        return;
-      }
-
-      const isCurrentlyConnected = profile.id === activeProfileId;
-
-      if (isCurrentlyConnected) {
-        // Disconnect
+      if (profile.id === activeProfileId) {
+        // Disconnect needs the session id of the live connection.
+        const activeSessionId = requireSessionId(zh, sessionId);
+        if (!activeSessionId) return;
         try {
-          await apiFetch(`/remote/connections/${sessionId}`, {
+          await apiFetch(`/remote/connections/${activeSessionId}`, {
             method: "DELETE",
           });
           antdMessage.success("Disconnected");
@@ -708,34 +955,44 @@ function buildPlugin() {
         } catch (e: any) {
           antdMessage.error(`Disconnect failed: ${e.message}`);
         }
-      } else {
-        // Connect
-        setConnectingId(profile.id);
-        try {
-          const result = await apiFetch(`/remote/profiles/${profile.id}/connect`, {
-            method: "POST",
-            body: JSON.stringify({ session_id: sessionId }),
-          });
-          antdMessage.success(zh ? `已连接到 ${profile.name}` : `Connected to ${profile.name}`);
+        return;
+      }
 
-          if (result.sudo_needs_password) {
-            const sudoPwd = prompt(
-              zh ? "SSH 使用密钥认证，需要输入 sudo 密码：" : "SSH uses key auth. Enter sudo password:"
-            );
-            if (sudoPwd) {
-              await apiFetch(`/remote/connections/${sessionId}/sudo`, {
-                method: "POST",
-                body: JSON.stringify({ password: sudoPwd, enabled: true }),
-              });
-            }
-          }
-
-          fetchData();
-        } catch (e: any) {
-          antdMessage.error(zh ? `连接失败: ${e.message}` : `Connection failed: ${e.message}`);
-        } finally {
-          setConnectingId(null);
+      // Connect. A brand-new chat has no session id yet, so an empty id is
+      // sent and the backend defers the connect to the chat's first turn.
+      setConnectingId(profile.id);
+      try {
+        const result = await connectViaProfile(profile.id, sessionId, zh);
+        if (result?.pending) {
+          antdMessage.info(
+            zh
+              ? `已记录：本对话发出第一条消息后自动连接 ${profile.name}`
+              : `Recorded: will connect to ${profile.name} on this chat's first message`,
+          );
+        } else {
+          antdMessage.success(
+            zh
+              ? `已连接到 ${profile.name}`
+              : `Connected to ${profile.name}`,
+          );
         }
+
+        if (result?.sudo_needs_password && sessionId) {
+          const sudoPwd = prompt(
+            zh ? "未配置 sudo 密码，需要时请输入（留空跳过）：" : "Sudo password is not configured. Enter it if needed (empty to skip):"
+          );
+          if (sudoPwd) {
+            await apiFetch(`/remote/connections/${sessionId}/sudo`, {
+              method: "POST",
+              body: JSON.stringify({ password: sudoPwd, enabled: true }),
+            });
+          }
+        }
+        fetchData();
+      } catch (e: any) {
+        antdMessage.error(zh ? `连接失败: ${e.message}` : `Connection failed: ${e.message}`);
+      } finally {
+        setConnectingId(null);
       }
     };
 
@@ -752,8 +1009,7 @@ function buildPlugin() {
     };
 
     const handleSetCwd = async (nextCwd?: string) => {
-      const sessionId = getSessionId();
-      if (!sessionId) return;
+      if (!requireSessionId(zh, sessionId)) return;
       const targetCwd = (nextCwd ?? cwdValue).trim();
       if (!targetCwd) return;
       setCwdEditing(true);
@@ -1003,7 +1259,13 @@ function buildPlugin() {
                                 { color: "success" },
                                 zh ? "已连接" : "Connected",
                               )
-                            : null,
+                            : profile.id === pendingProfileId
+                              ? React.createElement(
+                                  Tag,
+                                  { color: "processing" },
+                                  zh ? "待连接" : "Pending",
+                                )
+                              : null,
                         ),
                         React.createElement(
                           "div",
@@ -1200,7 +1462,30 @@ function buildPlugin() {
           ),
           React.createElement(
             Form.Item,
-            { name: "jump_host_id", label: zh ? "跳板机" : "Jump Host" },
+            {
+              name: "sudo_password",
+              label: React.createElement(Space, null,
+                zh ? "sudo 密码" : "Sudo Password",
+                editingProfile?.has_sudo_password
+                  ? React.createElement(Tag, { color: "green", style: { marginLeft: 4 } }, zh ? "已设置" : "Set")
+                  : null,
+              ),
+              tooltip: zh
+                ? "仅用于 sudo，不会复用 SSH 登录密码"
+                : "Used only for sudo. Never reuses the SSH login password.",
+            },
+            React.createElement(Input.Password, {
+              placeholder: editingProfile
+                ? (zh ? "留空则保留已保存的 sudo 密码" : "Leave empty to keep the saved sudo password")
+                : (zh ? "可选，非交互式 sudo 时填写" : "Optional; needed for non-interactive sudo"),
+            }),
+          ),
+          React.createElement(
+            Form.Item,
+            {
+              name: "jump_host_id",
+              label: zh ? "跳板机" : "Jump Host",
+            },
             React.createElement(Select, {
               allowClear: true,
               placeholder: zh ? "直连（不使用跳板机）" : "Direct connection (no jump host)",
@@ -1211,6 +1496,19 @@ function buildPlugin() {
                 value: jumpHost.id,
               })),
             }),
+          ),
+          React.createElement(
+            Form.Item,
+            {
+              name: "accept_new_host_key",
+              label: zh ? "信任未知主机密钥" : "Trust Unknown Host Key",
+              valuePropName: "checked",
+              initialValue: false,
+              tooltip: zh
+                ? "默认拒绝未记录在 known_hosts 中的主机密钥（防中间人攻击）。仅在核对过主机指纹后开启。"
+                : "Unknown host keys are rejected by default to prevent man-in-the-middle attacks. Enable only after verifying the host fingerprint.",
+            },
+            React.createElement(Switch),
           ),
           React.createElement(
             Form.Item,
@@ -1409,23 +1707,28 @@ function buildPlugin() {
     const [reconnecting, setReconnecting] = useState(false);
     const prevConnectedRef = React.useRef(false);
 
+    const [sessionId, setSessionId] = useState(getSessionId() || "");
+
     const fetchStatus = useCallback(async () => {
       try {
         setLoading(true);
         setError("");
-        const sessionId = getSessionId() || "";
-        const encodedSessionId = encodeURIComponent(sessionId);
-        const [connectionData, profileData, healthData] = await Promise.all([
-          apiFetch(`/remote/connections?session_id=${encodedSessionId}`),
-          apiFetch(`/remote/profiles?session_id=${encodedSessionId}`),
-          apiFetch(`/remote/connections/${encodedSessionId}/health`).catch(() => ({ health: null })),
+        // The owner-scoped lookup works without a "current session", which the
+        // host does not provide on non-chat routes.
+        const [active, profileData] = await Promise.all([
+          fetchActiveConnection(),
+          apiFetch("/remote/profiles"),
         ]);
-        const conns = connectionData.connections || [];
-        const newConn = conns.length > 0 ? conns[0] : null;
+        const newConn = active?.connection || null;
+        const sid = active?.session_id
+          ? String(active.session_id)
+          : getSessionId() || "";
+        setSessionId(sid);
+
         let nextRemoteInfo = null as any;
-        if (newConn) {
+        if (newConn && sid) {
           const infoData = await apiFetch(
-            `/remote/connections/${encodedSessionId}/info`,
+            `/remote/connections/${sid}/info`,
           ).catch(() => ({ info: null }));
           nextRemoteInfo = infoData.info || null;
         }
@@ -1437,8 +1740,8 @@ function buildPlugin() {
         prevConnectedRef.current = isNowConnected;
         setConnection(newConn);
         setProfiles(profileData.profiles || []);
-        setActiveProfileId(profileData.active_profile_id || "");
-        setHealth(healthData.health || null);
+        setActiveProfileId(newConn?.profile_id || "");
+        setHealth(active?.health || null);
         setRemoteInfo(nextRemoteInfo);
       } catch (e: any) {
         const errorMsg = e.message || String(e);
@@ -1454,7 +1757,7 @@ function buildPlugin() {
       } finally {
         setLoading(false);
       }
-    }, []);
+    }, [zh]);
 
     useEffect(() => {
       fetchStatus();
@@ -1463,8 +1766,7 @@ function buildPlugin() {
     }, [fetchStatus]);
 
     const handleDisconnect = async () => {
-      const sessionId = getSessionId();
-      if (!sessionId) return;
+      if (!requireSessionId(zh, sessionId)) return;
       try {
         await apiFetch(`/remote/connections/${sessionId}`, {
           method: "DELETE",
@@ -1476,8 +1778,7 @@ function buildPlugin() {
     };
 
     const handleReconnect = async () => {
-      const sessionId = getSessionId();
-      if (!sessionId) return;
+      if (!requireSessionId(zh, sessionId)) return;
       setReconnecting(true);
       try {
         await apiFetch(`/remote/connections/${sessionId}/reconnect`, {
@@ -1493,32 +1794,30 @@ function buildPlugin() {
     };
 
     const handleProfileClick = async (profile: any) => {
-      const sessionId = getSessionId();
-      if (!sessionId) {
-        antdMessage.error(zh ? "无活跃会话，请先打开一个对话。" : "No active session. Open a chat first.");
-        return;
-      }
+      const activeSessionId = requireSessionId(zh, sessionId);
+      if (!activeSessionId) return;
 
       const isActive = profile.id === activeProfileId;
       setConnectingId(profile.id);
       try {
         if (isActive) {
-          await apiFetch(`/remote/connections/${sessionId}`, {
+          await apiFetch(`/remote/connections/${activeSessionId}`, {
             method: "DELETE",
           });
         } else {
-          const result = await apiFetch(`/remote/profiles/${profile.id}/connect`, {
-            method: "POST",
-            body: JSON.stringify({ session_id: sessionId }),
-          });
+          const result = await connectViaProfile(
+            profile.id,
+            activeSessionId,
+            zh,
+          );
           antdMessage.success(zh ? `已连接到 ${profile.name}` : `Connected to ${profile.name}`);
 
           if (result.sudo_needs_password) {
             const sudoPwd = prompt(
-              zh ? "SSH 使用密钥认证，需要输入 sudo 密码：" : "SSH uses key auth. Enter sudo password:"
+              zh ? "未配置 sudo 密码，需要时请输入（留空跳过）：" : "Sudo password is not configured. Enter it if needed (empty to skip):"
             );
             if (sudoPwd) {
-              await apiFetch(`/remote/connections/${sessionId}/sudo`, {
+              await apiFetch(`/remote/connections/${activeSessionId}/sudo`, {
                 method: "POST",
                 body: JSON.stringify({ password: sudoPwd, enabled: true }),
               });
@@ -1786,556 +2085,17 @@ function buildPlugin() {
   }
 
   function registerHeaderStatus() {
-    const qwenpaw = (window as any).QwenPaw;
-    const slot = qwenpaw?.slot;
-    if (typeof slot?.fill === "function") {
-      try {
-        slot.fill(
-          "remote",
-          "header.left",
-          () => React.createElement(RemoteStatusIndicator),
-          { id: "remote-ssh-status", order: 15 },
-        );
-        console.log("[Remote] Registered header status via QwenPaw.slot.fill");
-        return true;
-      } catch (e) {
-        console.debug("[Remote] QwenPaw.slot.fill failed:", e);
-      }
-    }
-
-    const item = {
-      id: "remote-ssh-status",
-      key: "remote-ssh-status",
-      pluginId: "remote",
-      label: "Remote SSH",
-      component: RemoteStatusIndicator,
-      priority: 15,
-      placement: "left",
-    };
-
-    const candidates: Array<[string, any[]]> = [
-      ["registerHeaderWidget", [item]],
-      ["registerTopBarItem", [item]],
-      ["registerNavWidget", [item]],
-      ["registerNavbarItem", [item]],
-      ["registerToolbarItem", [item]],
-      ["registerStatusWidget", [item]],
-      ["registerSlot", ["header:left", item]],
-      ["registerSlot", ["topbar:left", item]],
-      ["registerSlot", ["toolbar:left", item]],
-      ["registerSlot", ["navbar:left", item]],
-    ];
-
-    for (const [name, args] of candidates) {
-      const register = qwenpaw?.[name];
-      if (typeof register !== "function") continue;
-      try {
-        register.apply(qwenpaw, args);
-        console.log(`[Remote] Registered header widget via ${name}`);
-        return true;
-      } catch (e) {
-        console.debug(`[Remote] ${name} failed:`, e);
-      }
-    }
-
-    console.debug(
-      "[Remote] No QwenPaw header extension API found; will use DOM fallback.",
-    );
-    return false;
-  }
-
-  function findHeaderMountContainer(): HTMLElement | null {
-    const selectors = [
-      "[data-qwenpaw-header]",
-      "[data-qwenpaw-topbar]",
-      "[data-app-header]",
-      ".qwenpaw-header",
-      ".qwenpaw-topbar",
-      ".app-header",
-      ".topbar",
-      ".top-bar",
-      ".navbar",
-      ".nav-bar",
-      ".ant-layout-header",
-      "header",
-      "nav",
-    ];
-
-    for (const selector of selectors) {
-      const candidates = Array.from(
-        document.querySelectorAll<HTMLElement>(selector),
-      );
-      for (const candidate of candidates) {
-        const rect = candidate.getBoundingClientRect();
-        if (
-          rect.top >= 0 &&
-          rect.top < 120 &&
-          rect.width >= 320 &&
-          rect.height >= 32 &&
-          rect.height <= 120
-        ) {
-          return candidate;
-        }
-      }
-    }
-
-    // Web 端备选策略：查找最顶部的 flex 容器
-    const topContainers = Array.from(
-      document.querySelectorAll<HTMLElement>("div[style*='flex'],div[class*='flex']"),
-    )
-      .filter((el) => {
-        const rect = el.getBoundingClientRect();
-        if (
-          rect.top < -50 ||
-          rect.top >= 100 ||
-          rect.width < 480 ||
-          rect.height < 40 ||
-          rect.height > 120
-        ) {
-          return false;
-        }
-        const style = window.getComputedStyle(el);
-        return (
-          style.display === "flex" ||
-          style.display === "grid" ||
-          style.alignItems === "center"
-        );
-      })
-      .sort((a, b) => {
-        const ar = a.getBoundingClientRect();
-        const br = b.getBoundingClientRect();
-        return ar.top - br.top || ar.height - br.height;
-      });
-
-    return topContainers[0] || null;
-  }
-
-  function mountHeaderStatusFallback() {
-    const existingFallback = document.getElementById(
-      "remote-ssh-header-status",
-    );
-    if (
-      existingFallback &&
-      existingFallback.dataset.remoteBuild !== REMOTE_PLUGIN_BUILD_ID
-    ) {
-      existingFallback.remove();
-    }
-
-    const existing =
-      document.getElementById("remote-ssh-header-status") ||
-      document.getElementById("remote-ssh-header-status-react");
-    if (existing) return true;
-
-    const headerLabels = [
-      "文档资料",
-      "Docs",
-      "Documentation",
-      "GitHub",
-      "代码",
-      "Code",
-    ];
-    const matched = Array.from(
-      document.querySelectorAll<HTMLElement>(
-        "button,a,[role='button'],span,div",
-      ),
-    ).filter((el) => {
-      const text = (el.textContent || "").trim();
-      const rect = el.getBoundingClientRect();
-      return (
-        rect.top >= 0 &&
-        rect.top < 96 &&
-        rect.width > 0 &&
-        rect.width < 320 &&
-        rect.height > 0 &&
-        headerLabels.some((label) => text.includes(label))
-      );
-    });
-    const targets = Array.from(
-      new Set(
-        matched.map(
-          (el) =>
-            (el.closest("button,a,[role='button']") as HTMLElement | null) ||
-            el,
-        ),
-      ),
-    ).sort((a, b) => {
-      const score = (el: HTMLElement) => {
-        const text = (el.textContent || "").trim();
-        const rect = el.getBoundingClientRect();
-        const exact = headerLabels.includes(text);
-        return (exact ? 0 : 10000) + rect.width * rect.height;
-      };
-      return score(a) - score(b);
-    });
-    const target = targets[0];
-    const parent = target?.parentElement || findHeaderMountContainer();
-    if (!parent) {
-      console.warn("[Remote] Header DOM mount point not found.");
-      return false;
-    }
-
-    const root = document.createElement("div");
-    root.id = "remote-ssh-header-status";
-    root.dataset.remoteBuild = REMOTE_PLUGIN_BUILD_ID;
-    root.style.display = "inline-flex";
-    root.style.alignItems = "center";
-    root.style.flex = "0 0 auto";
-    root.style.minWidth = "156px";
-    root.style.margin = "0 8px";
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.style.height = "38px";
-    button.style.minWidth = "156px";
-    button.style.maxWidth = "220px";
-    button.style.padding = "0 12px";
-    button.style.display = "inline-flex";
-    button.style.flex = "0 0 auto";
-    button.style.alignItems = "center";
-    button.style.justifyContent = "center";
-    button.style.gap = "8px";
-    button.style.border = `1px solid ${theme.border}`;
-    button.style.borderRadius = "6px";
-    button.style.background = theme.bgContainer;
-    button.style.color = theme.text;
-    button.style.font = "inherit";
-    button.style.cursor = "pointer";
-    button.style.whiteSpace = "nowrap";
-
-    const dot = document.createElement("span");
-    dot.style.width = "8px";
-    dot.style.height = "8px";
-    dot.style.borderRadius = "50%";
-    dot.style.background = theme.secondaryText;
-    dot.style.flex = "0 0 auto";
-
-    const label = document.createElement("span");
-    label.textContent = "SSH Offline";
-    label.style.minWidth = "0";
-    label.style.overflow = "hidden";
-    label.style.textOverflow = "ellipsis";
-    label.style.fontSize = "14px";
-    label.style.fontWeight = "600";
-
-    const panel = document.createElement("div");
-    panel.style.position = "fixed";
-    panel.style.zIndex = "10000";
-    panel.style.width = "320px";
-    panel.style.padding = "12px";
-    panel.style.border = `1px solid ${theme.border}`;
-    panel.style.borderRadius = "8px";
-    panel.style.background = theme.bgElevated;
-    panel.style.color = theme.text;
-    panel.style.boxShadow = theme.shadow;
-    panel.style.display = "none";
-
-    const panelTitle = document.createElement("div");
-    panelTitle.style.fontWeight = "600";
-    panelTitle.style.marginBottom = "8px";
-
-    const panelBody = document.createElement("div");
-    panelBody.style.fontSize = "12px";
-    panelBody.style.color = theme.secondaryText;
-    panelBody.style.wordBreak = "break-all";
-
-    const profileTitle = document.createElement("div");
-    profileTitle.textContent = "Saved Devices";
-    profileTitle.style.marginTop = "10px";
-    profileTitle.style.paddingTop = "10px";
-    profileTitle.style.borderTop = `1px solid ${theme.border}`;
-    profileTitle.style.fontWeight = "600";
-
-    const profileList = document.createElement("div");
-    profileList.style.display = "flex";
-    profileList.style.flexDirection = "column";
-    profileList.style.gap = "6px";
-    profileList.style.marginTop = "8px";
-
-    const disconnect = document.createElement("button");
-    disconnect.type = "button";
-    disconnect.textContent = "Disconnect";
-    disconnect.style.marginTop = "10px";
-    disconnect.style.height = "28px";
-    disconnect.style.padding = "0 10px";
-    disconnect.style.border = `1px solid ${theme.errorBorder}`;
-    disconnect.style.borderRadius = "4px";
-    disconnect.style.background = theme.bgElevated;
-    disconnect.style.color = theme.error;
-    disconnect.style.cursor = "pointer";
-    disconnect.style.display = "none";
-
-    panel.append(panelTitle, panelBody, disconnect, profileTitle, profileList);
-    button.append(dot, label);
-    root.append(button, panel);
-    if (target && target.parentElement === parent) {
-      parent.insertBefore(root, target);
-    } else {
-      parent.appendChild(root);
-    }
-
-    const ensureVisibleMount = () => {
-      const rootRect = root.getBoundingClientRect();
-      const buttonRect = button.getBoundingClientRect();
-      if (rootRect.width >= 120 && buttonRect.width >= 120) return;
-
-      document.body.appendChild(root);
-      root.style.position = "fixed";
-      root.style.top = "12px";
-      root.style.right = "156px";
-      root.style.zIndex = "10000";
-      root.style.margin = "0";
-      root.style.minWidth = "156px";
-      console.debug("[Remote] Header status moved to fixed fallback mount.");
-    };
-
-    window.setTimeout(ensureVisibleMount, 50);
-    window.setTimeout(ensureVisibleMount, 1000);
-
-    let currentConnection: any = null;
-
-    const renderProfiles = (profiles: any[], activeProfileId: string) => {
-      profileList.replaceChildren();
-
-      if (profiles.length === 0) {
-        const empty = document.createElement("div");
-        empty.textContent = "No saved devices. Add one from Remote SSH.";
-        empty.style.color = theme.secondaryText;
-        empty.style.fontSize = "12px";
-        profileList.append(empty);
-        return;
-      }
-
-      for (const profile of profiles) {
-        const active = profile.id === activeProfileId;
-        const row = document.createElement("div");
-        row.style.display = "flex";
-        row.style.alignItems = "center";
-        row.style.justifyContent = "space-between";
-        row.style.gap = "8px";
-
-        const info = document.createElement("div");
-        info.style.flex = "1";
-        info.style.minWidth = "0";
-        info.style.overflow = "hidden";
-
-        const name = document.createElement("div");
-        name.textContent =
-          profile.name || `${profile.username}@${profile.host}`;
-        name.title = name.textContent;
-        name.style.color = theme.text;
-        name.style.fontSize = "14px";
-        name.style.fontWeight = active ? "600" : "500";
-        name.style.lineHeight = "20px";
-        name.style.maxWidth = "200px";
-        name.style.overflow = "hidden";
-        name.style.textOverflow = "ellipsis";
-        name.style.whiteSpace = "nowrap";
-
-        const endpoint = document.createElement("div");
-        endpoint.textContent = `${profile.username}@${profile.host}:${profile.port}`;
-        endpoint.title = endpoint.textContent;
-        endpoint.style.color = theme.secondaryText;
-        endpoint.style.fontSize = "12px";
-        endpoint.style.lineHeight = "18px";
-        endpoint.style.maxWidth = "200px";
-        endpoint.style.overflow = "hidden";
-        endpoint.style.textOverflow = "ellipsis";
-        endpoint.style.whiteSpace = "nowrap";
-
-        const via = document.createElement("div");
-        via.textContent = profile.jump_host_name
-          ? `via ${profile.jump_host_name}`
-          : "";
-        via.title = via.textContent;
-        via.style.color = theme.secondaryText;
-        via.style.fontSize = "12px";
-        via.style.lineHeight = "18px";
-        via.style.maxWidth = "200px";
-        via.style.overflow = "hidden";
-        via.style.textOverflow = "ellipsis";
-        via.style.whiteSpace = "nowrap";
-        via.style.display = profile.jump_host_name ? "" : "none";
-
-        const action = document.createElement("button");
-        action.type = "button";
-        action.textContent = active ? "Disconnect" : "Connect";
-        action.style.height = "28px";
-        action.style.padding = "0 10px";
-        action.style.border = active
-          ? `1px solid ${theme.errorBorder}`
-          : `1px solid ${theme.primary}`;
-        action.style.borderRadius = "4px";
-        action.style.background = active ? theme.bgElevated : theme.primary;
-        action.style.color = active ? theme.error : theme.primaryText;
-        action.style.cursor = "pointer";
-        action.addEventListener("click", async () => {
-          const sessionId = getSessionId();
-          if (!sessionId) {
-            antdMessage.error("No active session. Open a chat first.");
-            return;
-          }
-
-          action.disabled = true;
-          action.textContent = active ? "Disconnecting" : "Connecting";
-          try {
-            if (active) {
-              await apiFetch(`/remote/connections/${sessionId}`, {
-                method: "DELETE",
-              });
-              antdMessage.success("Disconnected");
-            } else {
-              await apiFetch(`/remote/profiles/${profile.id}/connect`, {
-                method: "POST",
-                body: JSON.stringify({ session_id: sessionId }),
-              });
-              antdMessage.success(`Connected to ${profile.name}`);
-            }
-            await refresh();
-          } catch (e: any) {
-            antdMessage.error(
-              `${active ? "Disconnect" : "Connection"} failed: ${e.message}`,
-            );
-          } finally {
-            action.disabled = false;
-          }
-        });
-
-        info.append(name, endpoint, via);
-        row.append(info, action);
-        profileList.append(row);
-      }
-    };
-
-    const render = (
-      connection: any,
-      profiles: any[] = [],
-      activeProfileId = "",
-      error = "",
-    ) => {
-      currentConnection = connection;
-      if (connection) {
-        const host = `${connection.username}@${connection.host}:${connection.port}`;
-        button.style.borderColor = theme.successBorder;
-        button.style.background = theme.successBg;
-        button.style.color = theme.success;
-        dot.style.background = theme.success;
-        label.textContent = `${connection.username}@${connection.host}`;
-        button.title = host;
-        panelTitle.textContent = "SSH Connected";
-        panelBody.textContent = `${host}\nUptime: ${Math.round(
-          connection.uptime_seconds || 0,
-        )}s\nWork Dir: ${connection.default_cwd || "/"}`;
-        panelBody.style.whiteSpace = "pre-line";
-        disconnect.style.display = "";
-      } else {
-        button.style.borderColor = error ? theme.errorBorder : theme.border;
-        button.style.background = error ? theme.errorBg : theme.bgContainer;
-        button.style.color = error ? theme.error : theme.text;
-        dot.style.background = error ? theme.error : theme.secondaryText;
-        label.textContent = error ? "SSH Error" : "SSH Offline";
-        button.title = error || "No active SSH connection";
-        panelTitle.textContent = error ? "SSH Status Error" : "SSH Offline";
-        panelBody.textContent =
-          error || "No active SSH connection for this chat.";
-        panelBody.style.whiteSpace = "normal";
-        disconnect.style.display = "none";
-      }
-      renderProfiles(profiles, activeProfileId);
-    };
-
-    const refresh = async () => {
-      try {
-        const sessionId = getSessionId() || "";
-        const encodedSessionId = encodeURIComponent(sessionId);
-        const [connectionData, profileData] = await Promise.all([
-          apiFetch(`/remote/connections?session_id=${encodedSessionId}`),
-          apiFetch(`/remote/profiles?session_id=${encodedSessionId}`),
-        ]);
-        const conns = connectionData.connections || [];
-        render(
-          conns.length > 0 ? conns[0] : null,
-          profileData.profiles || [],
-          profileData.active_profile_id || "",
-        );
-      } catch (e: any) {
-        render(null, [], "", e.message || "Failed to load SSH status.");
-      }
-    };
-
-    const placePanel = () => {
-      const rect = button.getBoundingClientRect();
-      panel.style.top = `${rect.bottom + 8}px`;
-      panel.style.left = `${Math.min(
-        rect.left,
-        window.innerWidth - 340,
-      )}px`;
-    };
-
-    button.addEventListener("click", () => {
-      placePanel();
-      panel.style.display = panel.style.display === "none" ? "block" : "none";
-    });
-    document.addEventListener("click", (event) => {
-      if (!root.contains(event.target as Node)) panel.style.display = "none";
-    });
-    disconnect.addEventListener("click", async () => {
-      const sessionId = getSessionId();
-      if (!sessionId || !currentConnection) return;
-      try {
-        await apiFetch(`/remote/connections/${sessionId}`, {
-          method: "DELETE",
-        });
-        antdMessage.success("Disconnected");
-        await refresh();
-      } catch (e: any) {
-        antdMessage.error(`Disconnect failed: ${e.message}`);
-      }
-    });
-
-    refresh();
-    window.setInterval(refresh, 5000);
-    return true;
-  }
-
-  function mountHeaderStatusFallbackWhenReady() {
-    if (mountHeaderStatusFallback()) return;
-
-    let attempts = 0;
-    const maxAttempts = 40;
-    let observer: MutationObserver | null = null;
-
-    const tryMount = () => {
-      attempts += 1;
-      if (mountHeaderStatusFallback()) {
-        observer?.disconnect();
-        window.clearInterval(timer);
-        return;
-      }
-
-      if (attempts >= maxAttempts) {
-        observer?.disconnect();
-        window.clearInterval(timer);
-      }
-    };
-
-    const timer = window.setInterval(tryMount, 250);
-    observer = new MutationObserver(tryMount);
-    observer.observe(document.body, { childList: true, subtree: true });
-  }
-
-  function warnIfRemotePageLooksCached() {
-    const text = document.body?.textContent || "";
-    if (!text.includes("Remote SSH")) return;
-    if (text.includes("Jump Hosts") || text.includes("New Jump Host")) return;
-    console.warn(
-      "[Remote] Remote SSH page is missing Jump Hosts UI. " +
-        "The web host may still be serving a cached older frontend bundle.",
+    qwenpaw.slot.fill(
+      REMOTE_PLUGIN_ID,
+      "header.left",
+      () => React.createElement(RemoteStatusIndicator),
+      { id: "remote-ssh-status", order: 15 },
     );
   }
 
   // ── Register plugin ──────────────────────────────────────────────────
 
-  (window as any).QwenPaw.registerToolRender?.("remote", {
+  const TOOL_RENDERERS: Record<string, (props: { data: any }) => any> = {
     remote_connect: RemoteConnectRender,
     remote_disconnect: RemoteDisconnectRender,
     remote_list: RemoteListRender,
@@ -2345,158 +2105,75 @@ function buildPlugin() {
     remote_health: RemoteHealthRender,
     remote_set_cwd: RemoteSetCwdRender,
     remote_sudo: RemoteSudoRender,
-  });
-
-  const remoteRoute = {
-    id: "remote",
-    key: "remote",
-    pluginId: "remote",
-    path: "/remote",
-    component: RemotePage,
-    label: "Remote SSH",
-    title: "Remote SSH",
-    name: "Remote SSH",
-    icon: "\u{1F517}",
-    priority: 20,
   };
 
-  function registerRemotePage() {
-    const qwenpaw = (window as any).QwenPaw;
-    const legacyRouteId = "legacy:remote:remote";
-    const sdkRouteId = "remote.main";
-    let triedLegacyRoute = false;
-
-    if (typeof qwenpaw?.registerRoutes === "function") {
-      try {
-        triedLegacyRoute = true;
-        qwenpaw.registerRoutes("remote", [remoteRoute]);
-        console.log("[Remote] Registered page via legacy registerRoutes");
-      } catch (e) {
-        console.debug("[Remote] registerRoutes failed:", e);
-      }
-    }
-
-    if (triedLegacyRoute && typeof qwenpaw?.route?.replace === "function") {
-      try {
-        qwenpaw.route.replace("remote", legacyRouteId, RemotePage);
-        console.log("[Remote] Replaced legacy route via QwenPaw.route.replace");
-        return true;
-      } catch (e) {
-        console.debug("[Remote] QwenPaw.route.replace legacy failed:", e);
-      }
-    }
-
-    if (typeof qwenpaw?.route?.add === "function") {
-      try {
-        qwenpaw.route.add("remote", {
-          id: sdkRouteId,
-          path: remoteRoute.path,
-          component: RemotePage,
-        });
-        qwenpaw.menu?.add?.("remote", {
-          id: "remote.main",
-          location: "primary.settings",
-          parentId: "plugins-group",
-          label: remoteRoute.label,
-          icon: remoteRoute.icon,
-          route: sdkRouteId,
-          order: remoteRoute.priority,
-        });
-        console.log("[Remote] Registered page via QwenPaw.route/menu SDK");
-        return true;
-      } catch (e) {
-        console.debug("[Remote] QwenPaw.route/menu SDK failed:", e);
-      }
-    }
-
-    const candidates: Array<[string, any[]]> = [
-      ["registerRoute", ["remote", remoteRoute]],
-      ["registerRoute", [remoteRoute]],
-      ["registerPage", ["remote", remoteRoute]],
-      ["registerPage", [remoteRoute]],
-      ["registerPluginPage", ["remote", remoteRoute]],
-      ["registerPluginPage", [remoteRoute]],
-      ["registerMenuItem", [remoteRoute]],
-      ["registerNavigationItem", [remoteRoute]],
-      ["registerNavItem", [remoteRoute]],
-    ];
-
-    for (const [name, args] of candidates) {
-      const register = qwenpaw?.[name];
-      if (typeof register !== "function") continue;
-      try {
-        register.apply(qwenpaw, args);
-        console.log(`[Remote] Registered page via ${name}`);
-        return true;
-      } catch (e) {
-        console.debug(`[Remote] ${name} failed:`, e);
-      }
-    }
-
-    console.warn("[Remote] No QwenPaw page registration API found.");
-    return false;
+  for (const [toolName, renderer] of Object.entries(TOOL_RENDERERS)) {
+    // chat.toolRender passes an untyped props record; the renderers normalize
+    // it, so pass the whole object rather than assuming a `result` key. The
+    // collapsible wrapper is applied once here for every tool card.
+    qwenpaw.chat.toolRender(
+      REMOTE_PLUGIN_ID,
+      toolName,
+      (props: Record<string, unknown>) => {
+        logToolShape(props, toolName, parseToolOutput(props));
+        return React.createElement(
+          CollapsibleToolBody,
+          null,
+          React.createElement(renderer, { data: props }),
+        );
+      },
+    );
   }
 
-  registerRemotePage();
+  const REMOTE_ROUTE_ID = "remote.main";
 
-  window.setTimeout(warnIfRemotePageLooksCached, 1000);
-  window.setTimeout(warnIfRemotePageLooksCached, 3000);
+  // The host passes the resolved session id to chat request transforms. Cache
+  // it so session-scoped calls work on hosts that expose neither
+  // getCurrentSessionId() nor a session global.
+  qwenpaw.chat.requestPayload.add(
+    REMOTE_PLUGIN_ID,
+    ({ sessionId }: { sessionId?: string }) => {
+      if (sessionId) cachedSessionId = String(sessionId);
+      // Returning undefined leaves the outgoing request body untouched.
+      return undefined;
+    },
+    { id: "remote.session-capture", order: 100 },
+  );
 
-  const registeredHeaderStatus = registerHeaderStatus();
-  if (!registeredHeaderStatus) {
-    mountHeaderStatusFallbackWhenReady();
-  } else {
-    // 延迟检查是否需要 DOM 回退（某些环境下 API 注册不生效）
-    window.setTimeout(() => {
-      if (!document.getElementById("remote-ssh-header-status-react")) {
-        mountHeaderStatusFallbackWhenReady();
-      }
-    }, 1000);
-  }
+  qwenpaw.route.add(REMOTE_PLUGIN_ID, {
+    id: REMOTE_ROUTE_ID,
+    path: "/remote",
+    component: RemotePage,
+  });
+
+  qwenpaw.menu.add(REMOTE_PLUGIN_ID, {
+    id: REMOTE_ROUTE_ID,
+    label: "Remote SSH",
+    icon: "\u{1F517}",
+    route: REMOTE_ROUTE_ID,
+    location: "primary.settings",
+    order: 20,
+  });
+
+  registerHeaderStatus();
 }
 
-// Auto-initialize when loaded
+// Auto-initialize when loaded. The host mounts window.QwenPaw (Host SDK and
+// registration API) before it downloads plugin bundles.
 function isQwenPawHostReady() {
   const host = (window as any).QwenPaw?.host;
-  return Boolean(
-    host?.React &&
-      host?.antd &&
-      host?.getApiUrl &&
-      host?.getApiToken,
-  );
+  return Boolean(host?.React && host?.antd && host?.getApiUrl);
 }
 
 function initializeWhenReady() {
-  if (isQwenPawHostReady()) {
-    buildPlugin();
+  if (!isQwenPawHostReady()) {
+    console.error(
+      "[Remote] window.QwenPaw Host SDK is unavailable; the Remote SSH UI " +
+        "was not registered.",
+    );
     return;
   }
-
-  let attempts = 0;
-  const maxAttempts = 120;
-  let observer: MutationObserver | null = null;
-
-  const tryInitialize = () => {
-    attempts += 1;
-    if (isQwenPawHostReady()) {
-      observer?.disconnect();
-      window.clearInterval(timer);
-      buildPlugin();
-      return;
-    }
-
-    if (attempts >= maxAttempts) {
-      observer?.disconnect();
-      window.clearInterval(timer);
-      console.warn("[Remote] QwenPaw.host not available, plugin not loaded");
-    }
-  };
-
-  const timer = window.setInterval(tryInitialize, 250);
-  if (document.body) {
-    observer = new MutationObserver(tryInitialize);
-    observer.observe(document.body, { childList: true, subtree: true });
-  }
+  buildPlugin();
 }
 
 initializeWhenReady();

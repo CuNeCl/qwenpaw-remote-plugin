@@ -26,6 +26,7 @@ async def remote_connect(
     jump_password: str = "",
     jump_key_path: str = "",
     jump_passphrase: str = "",
+    accept_new_host_key: bool = False,
 ) -> ToolResponse:
     """Connect to a remote device via SSH.
 
@@ -47,6 +48,9 @@ async def remote_connect(
         jump_password: Inline jump host SSH password.
         jump_key_path: Inline jump host private key path.
         jump_passphrase: Inline jump host private key passphrase.
+        accept_new_host_key: Trust an unknown remote host key on first
+            connect. Disabled by default; only enable it after verifying
+            the host fingerprint.
 
     Returns:
         ToolResponse with connection status.
@@ -94,6 +98,7 @@ async def remote_connect(
             jump_password=jump_password,
             jump_key_path=jump_key_path,
             jump_passphrase=jump_passphrase,
+            accept_new_host_key=accept_new_host_key,
         )
     except (ConnectionError, ValueError) as e:
         return ToolResponse(

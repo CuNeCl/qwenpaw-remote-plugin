@@ -1,8 +1,7 @@
-"""Shared SSH data structures and command helpers."""
+"""Shared SSH data structures."""
 
 from __future__ import annotations
 
-import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -119,6 +118,12 @@ class SSHConnectionInfo:
     jump_host: str = ""
     jump_port: int = 22
     jump_username: str = ""
+    #: Authentication subject that opened this session ("" for anonymous /
+    #: single-user deployments). Used to reject cross-caller session access.
+    owner: str = ""
+    #: "posix" or "windows"; drives command wrapping and probing.
+    os_family: str = "posix"
+    accept_new_host_key: bool = False
     connected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_used: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     default_cwd: str = "/"
@@ -142,6 +147,8 @@ class SSHConnectionInfo:
             "last_used": self.last_used.isoformat(),
             "default_cwd": self.default_cwd,
             "profile_id": self.profile_id,
+            "os_family": self.os_family,
+            "accept_new_host_key": self.accept_new_host_key,
             "jump_host_id": self.jump_host_id,
             "jump_host_name": self.jump_host_name,
             "jump_host": self.jump_host,
@@ -157,16 +164,3 @@ class SSHConnectionInfo:
             "remote_shell": self.remote_shell,
             "health": self.health.to_dict(),
         }
-
-
-def wrap_command_with_cwd(command: str, cwd: str, shell: str = "") -> str:
-    """Wrap a command with cd to the given working directory.
-
-    Handles fish shell syntax and proper quoting.
-    """
-    if not cwd or cwd == "/":
-        return command
-    quoted_cwd = shlex.quote(cwd)
-    is_fish = "fish" in (shell or "")
-    separator = "; and " if is_fish else " && "
-    return f"cd {quoted_cwd}{separator}{command}"

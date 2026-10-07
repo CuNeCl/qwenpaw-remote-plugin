@@ -1,7 +1,7 @@
 {
   "id": "remote",
   "name": "Remote SSH",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "type": "general",
   "description": "SSH into remote devices and execute shell commands transparently on remote machines.",
   "author": "AlpacaKnight",
@@ -10,10 +10,9 @@
     "backend": "plugin.py"
   },
   "dependencies": ["paramiko>=3.0.0"],
-  "min_version": "1.1.7",
   "qwenpaw_version": {
     "min": "2.0.0",
-    "max": "2.1.0"
+    "max": "2.3.0"
   },
   "meta": {
     "category": "remote-access",
@@ -28,55 +27,55 @@
       {
         "name": "remote_connect",
         "description": "Connect to a remote device via SSH. After connecting, all shell commands in this conversation will execute on the remote machine.",
-        "icon": "LinkOutlined",
+        "icon": "🔗",
         "config_fields": []
       },
       {
         "name": "remote_reconnect",
         "description": "Reconnect to the remote machine using cached connection parameters. Use when the previous SSH connection was lost.",
-        "icon": "ReloadOutlined",
+        "icon": "🔄",
         "config_fields": []
       },
       {
         "name": "remote_disconnect",
         "description": "Disconnect from the current remote SSH session.",
-        "icon": "DisconnectOutlined",
+        "icon": "🔌",
         "config_fields": []
       },
       {
         "name": "remote_list",
         "description": "Show the current remote SSH connection status.",
-        "icon": "CloudOutlined",
+        "icon": "☁️",
         "config_fields": []
       },
       {
         "name": "remote_exec",
         "description": "Explicitly execute a command on the remote machine via SSH.",
-        "icon": "CodeOutlined",
+        "icon": "💻",
         "config_fields": []
       },
       {
         "name": "remote_info",
         "description": "Show detailed information about the remote machine: OS, architecture, kernel, shell, CPU, memory, disk, and available development tools.",
-        "icon": "InfoCircleOutlined",
+        "icon": "ℹ️",
         "config_fields": []
       },
       {
         "name": "remote_health",
         "description": "Check the health status of the current remote SSH connection: status, latency, failures, reconnect availability.",
-        "icon": "HeartOutlined",
+        "icon": "❤️",
         "config_fields": []
       },
       {
         "name": "remote_set_cwd",
         "description": "Set the default remote working directory for this session. All subsequent commands will execute in this directory.",
-        "icon": "FolderOutlined",
+        "icon": "📁",
         "config_fields": []
       },
       {
         "name": "remote_sudo",
-        "description": "Execute a command with sudo privileges on the remote machine. Requires sudo password to be configured.",
-        "icon": "SafetyOutlined",
+        "description": "Execute a command with sudo privileges on the remote machine. Requires a configured sudo password (POSIX remotes only).",
+        "icon": "🛡️",
         "config_fields": []
       }
     ]

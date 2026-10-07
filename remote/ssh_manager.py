@@ -2,21 +2,311 @@
 
 import asyncio
 import logging
+import os
+import select
 import shlex
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
-from .store import find_jump_host_by_name, get_jump_host
+from . import platform as remote_platform
+from .store import KNOWN_HOSTS_FILE, find_jump_host_by_name, get_jump_host
 from .ssh_types import (
     RemoteEnvSnapshot,
     SSHConnectionInfo,
     SSHHealthInfo,
     SudoState,
     normalize_host_and_port,
-    wrap_command_with_cwd,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Module-level SSH helpers
+# ---------------------------------------------------------------------------
+
+def _read_channel(channel, timeout: float) -> tuple[str, str, bool]:
+    """Drain an SSH channel until it closes.
+
+    Returns ``(stdout, stderr, timed_out)``. On timeout the channel is closed
+    and whatever was received so far is returned.
+    """
+    stdout = b""
+    stderr = b""
+    start = time.monotonic()
+
+    while not channel.exit_status_ready():
+        if time.monotonic() - start > timeout:
+            channel.close()
+            return (
+                stdout.decode("utf-8", errors="replace"),
+                stderr.decode("utf-8", errors="replace"),
+                True,
+            )
+        readable, _, _ = select.select([channel], [], [], min(1.0, timeout))
+        if readable:
+            if channel.recv_ready():
+                stdout += channel.recv(65536)
+            if channel.recv_stderr_ready():
+                stderr += channel.recv_stderr(65536)
+
+    while channel.recv_ready():
+        stdout += channel.recv(65536)
+    while channel.recv_stderr_ready():
+        stderr += channel.recv_stderr(65536)
+
+    return (
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+        False,
+    )
+
+
+def _run_on_client(
+    client: Any,
+    command: str,
+    timeout: float = 20.0,
+    stdin_data: str = "",
+) -> tuple[int, str, str, bool]:
+    """Run a command on an already-connected SSHClient.
+
+    Returns ``(returncode, stdout, stderr, timed_out)``.
+    """
+    transport = client.get_transport()
+    if transport is None or not transport.is_active():
+        raise ConnectionError("SSH transport is closed")
+
+    channel = transport.open_session()
+    channel.settimeout(timeout)
+    channel.exec_command(command)
+
+    if stdin_data:
+        channel.sendall(stdin_data.encode("utf-8"))
+    channel.shutdown_write()
+
+    stdout, stderr, timed_out = _read_channel(channel, timeout)
+    returncode = -1 if timed_out else channel.recv_exit_status()
+    channel.close()
+    return returncode, stdout, stderr, timed_out
+
+
+def _build_connect_kwargs(
+    *,
+    hostname: str,
+    port: int,
+    username: str,
+    password: str = "",
+    key_path: str = "",
+    passphrase: str = "",
+    sock: object | None = None,
+) -> dict[str, Any]:
+    connect_kwargs: dict[str, Any] = {
+        "hostname": hostname,
+        "port": port,
+        "username": username,
+        "timeout": 15,
+    }
+    if password:
+        connect_kwargs["password"] = password
+    if key_path:
+        connect_kwargs["key_filename"] = key_path
+    if passphrase:
+        connect_kwargs["passphrase"] = passphrase
+    if sock is not None:
+        connect_kwargs["sock"] = sock
+    return connect_kwargs
+
+
+def _load_known_hosts(client: Any) -> None:
+    """Load the system, per-user and plugin known_hosts files."""
+    try:
+        client.load_system_host_keys()
+    except Exception as exc:  # pragma: no cover - platform dependent
+        logger.debug("[Remote] Could not load system host keys: %s", exc)
+
+    candidates = [Path.home() / ".ssh" / "known_hosts", KNOWN_HOSTS_FILE]
+    for known_hosts in candidates:
+        try:
+            if known_hosts.is_file():
+                client.load_host_keys(str(known_hosts))
+        except Exception as exc:  # pragma: no cover - platform dependent
+            logger.debug("[Remote] Could not load %s: %s", known_hosts, exc)
+
+
+def _remember_host_key(host: str, port: int, key: Any) -> None:
+    """Record an explicitly trusted host key in the plugin known_hosts file.
+
+    Trust-on-first-use: the key is written once, so later connections are
+    verified against it instead of needing ``accept_new_host_key`` forever.
+    """
+    if key is None:
+        return
+
+    entry_host = host if port == 22 else f"[{host}]:{port}"
+    try:
+        line = f"{entry_host} {key.get_name()} {key.get_base64()}\n"
+    except Exception as exc:  # pragma: no cover - unexpected key object
+        logger.debug("[Remote] Could not serialise host key: %s", exc)
+        return
+
+    try:
+        KNOWN_HOSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        existing = (
+            KNOWN_HOSTS_FILE.read_text(encoding="utf-8")
+            if KNOWN_HOSTS_FILE.is_file()
+            else ""
+        )
+        if line in existing:
+            return
+        if not existing:
+            existing = (
+                "# Host keys trusted through the Remote SSH plugin "
+                "(accept_new_host_key).\n"
+            )
+        KNOWN_HOSTS_FILE.write_text(existing + line, encoding="utf-8")
+        try:
+            os.chmod(KNOWN_HOSTS_FILE, 0o600)
+        except OSError:  # pragma: no cover - Windows / non-POSIX filesystems
+            pass
+        logger.info("[Remote] Recorded host key for %s:%d", host, port)
+    except OSError as exc:
+        logger.warning("[Remote] Could not record host key: %s", exc)
+
+
+def _remember_client_host_key(client: Any, host: str, port: int) -> None:
+    """Persist the key the server presented on a trusted connection."""
+    try:
+        transport = client.get_transport()
+        if transport is not None:
+            _remember_host_key(host, port, transport.get_remote_server_key())
+    except Exception as exc:  # pragma: no cover - transport dependent
+        logger.debug("[Remote] Could not read remote host key: %s", exc)
+
+
+def _new_client(accept_new_host_key: bool) -> Any:
+    """Build an SSHClient with the requested host key policy.
+
+    Without an explicit opt-in, unknown host keys are rejected so that a
+    man-in-the-middle cannot silently impersonate the target host.
+    """
+    import paramiko
+
+    client = paramiko.SSHClient()
+    _load_known_hosts(client)
+    if accept_new_host_key:
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    else:
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    return client
+
+
+def _open_jump_socket(
+    jump_config: dict[str, Any],
+    target_host: str,
+    target_port: int,
+    accept_new_host_key: bool,
+) -> tuple[Any, Any]:
+    """Connect to a jump host and open a direct-tcpip channel to the target."""
+    import paramiko
+
+    jump_client = _new_client(accept_new_host_key)
+    try:
+        jump_client.connect(
+            **_build_connect_kwargs(
+                hostname=jump_config["host"],
+                port=jump_config["port"],
+                username=jump_config["username"],
+                password=jump_config.get("password", ""),
+                key_path=jump_config.get("key_path", ""),
+                passphrase=jump_config.get("passphrase", ""),
+            )
+        )
+        transport = jump_client.get_transport()
+        if transport is None or not transport.is_active():
+            raise ConnectionError("Jump host SSH transport is closed")
+        sock = transport.open_channel(
+            "direct-tcpip",
+            (target_host, target_port),
+            ("", 0),
+        )
+    except paramiko.AuthenticationException as exc:
+        jump_client.close()
+        raise ConnectionError(
+            "Jump host authentication failed for "
+            f"{jump_config['username']}@{jump_config['host']}:{jump_config['port']}. "
+            "Check your jump host username and password/key. "
+            f"({exc})"
+        ) from exc
+    except Exception:
+        jump_client.close()
+        raise
+
+    return jump_client, sock
+
+
+def _probe_remote_platform(
+    client: Any,
+    timeout: float = 15.0,
+) -> tuple[str, str, str]:
+    """Detect ``(os_family, shell, os_name)`` over an open client."""
+    try:
+        returncode, stdout, _stderr, timed_out = _run_on_client(
+            client, remote_platform.PLATFORM_PROBE_COMMAND, timeout
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Remote] Platform probe failed (%s); assuming POSIX remote", exc
+        )
+        return remote_platform.POSIX, "", ""
+
+    os_family, shell, os_name = remote_platform.parse_platform_probe(
+        -1 if timed_out else returncode, stdout
+    )
+    if os_family == remote_platform.POSIX:
+        return os_family, shell, os_name
+
+    # Windows: the login shell decides the command grammar.
+    shell = remote_platform.SHELL_CMD
+    try:
+        _rc, shell_out, _err, _to = _run_on_client(
+            client, remote_platform.WINDOWS_SHELL_PROBE_COMMAND, timeout
+        )
+        shell = remote_platform.detect_windows_shell(shell_out)
+    except Exception as exc:
+        logger.warning(
+            "[Remote] Windows shell probe failed (%s); assuming cmd.exe", exc
+        )
+    return remote_platform.WINDOWS, shell, "Windows"
+
+
+def _host_key_error_message(exc: Exception) -> str | None:
+    """Translate a paramiko host key rejection into an actionable message."""
+    message = str(exc)
+    if "known_hosts" not in message.lower():
+        return None
+    return (
+        f"{message}\nThe remote host key is not trusted yet. Verify the host "
+        "fingerprint out of band (for example `ssh-keyscan`), then trust it "
+        "once: the profile's \"Trust Unknown Host Key\" switch, "
+        "remote_connect(accept_new_host_key=True), or "
+        "/remote connect accept_new_host_key=true. The key is then recorded in "
+        f"{KNOWN_HOSTS_FILE} and later connections are verified against it."
+    )
+
+
+def _host_key_mismatch_message(host: str, port: int, exc: Exception) -> str:
+    """Message for a key that differs from the recorded one."""
+    return (
+        f"Host key mismatch for {host}:{port} — the server presented a "
+        "different key than the one recorded in known_hosts. This can mean a "
+        "man-in-the-middle attack, or that the host was re-installed with new "
+        "keys. Do not blindly trust it: verify the new fingerprint out of band, "
+        f"then remove the stale entry from {KNOWN_HOSTS_FILE} (or your "
+        f"~/.ssh/known_hosts) and connect again. ({exc})"
+    )
+
 
 
 class SSHManager:
@@ -34,7 +324,119 @@ class SSHManager:
             cls._instance._env_cache: dict[str, RemoteEnvSnapshot] = {}
             cls._instance._ENV_TTL = 60.0  # seconds
             cls._instance._sudo_state: dict[str, SudoState] = {}
+            #: session_id -> agent_id, learned by the chat middleware. Lets the
+            #: management UI find a connection without knowing a session id
+            #: (the settings route has no "current session").
+            cls._instance._session_owners: dict[str, str] = {}
+            #: agent_id -> connect kwargs, for connects requested before the
+            #: chat had a session id (a brand-new chat has none yet).
+            cls._instance._pending_connects: dict[str, dict[str, Any]] = {}
         return cls._instance
+
+    # ── Deferred connects ───────────────────────────────────────────
+
+    def set_pending_connect(self, agent_id: str, params: dict[str, Any]) -> None:
+        """Remember a connect to fulfil once the chat has a session id."""
+        if agent_id:
+            self._pending_connects[agent_id] = params
+
+    def pending_profile_id(self, agent_id: str) -> str:
+        """Profile id of the caller's deferred connect, if any."""
+        pending = self._pending_connects.get(agent_id)
+        return str(pending.get("profile_id", "")) if pending else ""
+
+    def clear_pending_connect(self, agent_id: str) -> None:
+        self._pending_connects.pop(agent_id, None)
+
+    async def materialize_pending(self, session_id: str, agent_id: str) -> bool:
+        """Open the deferred connection for ``agent_id``, once.
+
+        Called from the chat middleware, which is the first place that knows
+        the session id of a newly created chat.
+        """
+        if not session_id or not agent_id:
+            return False
+        params = self._pending_connects.get(agent_id)
+        if params is None:
+            return False
+
+        # Claim it before awaiting so concurrent requests cannot connect twice.
+        self._pending_connects.pop(agent_id, None)
+        if session_id in self._connections:
+            return False
+        try:
+            await self.connect(
+                session_id=session_id,
+                owner=agent_id,
+                **params,
+            )
+        except Exception as exc:
+            logger.warning("[Remote] Deferred connect failed: %s", exc)
+            return False
+        logger.info("[Remote] Deferred connect established for %s", session_id)
+        return True
+
+    # ── Session ownership ───────────────────────────────────────────
+
+    #: Upper bound for the session->agent map; oldest entries are dropped.
+    _SESSION_OWNERS_LIMIT = 512
+
+    def remember_session_owner(self, session_id: str, agent_id: str) -> None:
+        """Record which agent a chat session belongs to."""
+        if not session_id or not agent_id:
+            return
+        # Re-insert so the insertion order tracks recency.
+        self._session_owners.pop(session_id, None)
+        self._session_owners[session_id] = agent_id
+
+        if len(self._session_owners) > self._SESSION_OWNERS_LIMIT:
+            for key in list(self._session_owners)[: len(self._session_owners) // 2]:
+                self._session_owners.pop(key, None)
+
+    def resolve_session_for(self, subject: str) -> str | None:
+        """Most recent session observed for ``subject`` (or any, if anonymous)."""
+        session_ids = [
+            sid
+            for sid, owner in self._session_owners.items()
+            if owner == subject
+        ]
+        if not session_ids and not subject:
+            session_ids = list(self._session_owners.keys())
+        if not session_ids:
+            return None
+        for sid in reversed(session_ids):
+            if sid in self._connections:
+                return sid
+        return session_ids[-1]
+
+    def find_active_connection(
+        self,
+        subject: str,
+    ) -> tuple[str, SSHConnectionInfo] | None:
+        """Return ``(session_id, connection)`` for the caller's connection.
+
+        A connection is the caller's when it was opened by that caller
+        (``owner``) or when it lives on a chat session the middleware observed
+        for that caller. Anonymous callers (no identity header) match every
+        unowned connection, which is the single-user case.
+        """
+        for sid, info in self._connections.items():
+            if subject and info.owner == subject:
+                return sid, info
+
+        for sid in reversed(list(self._connections)):
+            info = self._connections[sid]
+            if info.owner and info.owner != subject:
+                continue
+            if subject and self._session_owners.get(sid, "") != subject:
+                continue
+            return sid, info
+
+        if not subject:
+            for sid, info in self._connections.items():
+                if not info.owner:
+                    return sid, info
+        return None
 
     async def connect(
         self,
@@ -54,6 +456,8 @@ class SSHManager:
         jump_password: str = "",
         jump_key_path: str = "",
         jump_passphrase: str = "",
+        accept_new_host_key: bool = False,
+        owner: str = "",
     ) -> dict:
         """Establish an SSH connection and store it for the session.
 
@@ -75,8 +479,10 @@ class SSHManager:
                 old = self._connections[session_id]
                 try:
                     old.client.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "[Remote] Error closing previous client: %s", exc
+                    )
                 del self._connections[session_id]
                 logger.info(
                     "[Remote] Closed previous connection for session %s",
@@ -94,75 +500,18 @@ class SSHManager:
             jump_passphrase=jump_passphrase,
         )
 
-        def _build_connect_kwargs(
-            *,
-            hostname: str,
-            port: int,
-            username: str,
-            password: str = "",
-            key_path: str = "",
-            passphrase: str = "",
-            sock: object | None = None,
-        ) -> dict:
-            connect_kwargs: dict[str, Any] = {
-                "hostname": hostname,
-                "port": port,
-                "username": username,
-                "timeout": 15,
-            }
-            if password:
-                connect_kwargs["password"] = password
-            if key_path:
-                connect_kwargs["key_filename"] = key_path
-            if passphrase:
-                connect_kwargs["passphrase"] = passphrase
-            if sock is not None:
-                connect_kwargs["sock"] = sock
-            return connect_kwargs
-
-        def _new_client() -> paramiko.SSHClient:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            return client
-
         def _do_connect() -> tuple[paramiko.SSHClient, paramiko.SSHClient | None]:
             jump_client = None
             sock = None
             if jump_config:
-                jump_client = _new_client()
-                try:
-                    jump_client.connect(
-                        **_build_connect_kwargs(
-                            hostname=jump_config["host"],
-                            port=jump_config["port"],
-                            username=jump_config["username"],
-                            password=jump_config.get("password", ""),
-                            key_path=jump_config.get("key_path", ""),
-                            passphrase=jump_config.get("passphrase", ""),
-                        )
-                    )
-                    transport = jump_client.get_transport()
-                    if transport is None or not transport.is_active():
-                        raise ConnectionError("Jump host SSH transport is closed")
-                    sock = transport.open_channel(
-                        "direct-tcpip",
-                        (host, port),
-                        ("", 0),
-                    )
-                except paramiko.AuthenticationException as e:
-                    jump_client.close()
-                    raise ConnectionError(
-                        "Jump host authentication failed for "
-                        f"{jump_config['username']}@"
-                        f"{jump_config['host']}:{jump_config['port']}. "
-                        "Check your jump host username and password/key. "
-                        f"({e})"
-                    ) from e
-                except Exception:
-                    jump_client.close()
-                    raise
+                jump_client, sock = _open_jump_socket(
+                    jump_config,
+                    host,
+                    port,
+                    accept_new_host_key,
+                )
 
-            client = _new_client()
+            client = _new_client(accept_new_host_key)
             try:
                 client.connect(
                     **_build_connect_kwargs(
@@ -184,6 +533,10 @@ class SSHManager:
 
         try:
             client, jump_client = await asyncio.to_thread(_do_connect)
+        except paramiko.BadHostKeyException as e:
+            raise ConnectionError(
+                _host_key_mismatch_message(host, port, e)
+            ) from e
         except paramiko.AuthenticationException as e:
             raise ConnectionError(
                 f"Authentication failed for {username}@{host}:{port}. "
@@ -196,7 +549,8 @@ class SSHManager:
                 else ""
             )
             raise ConnectionError(
-                f"SSH error connecting to {host}:{port}{via}: {e}"
+                _host_key_error_message(e)
+                or f"SSH error connecting to {host}:{port}{via}: {e}"
             ) from e
         except (OSError, ConnectionError, TimeoutError) as e:
             via = (
@@ -207,6 +561,17 @@ class SSHManager:
             raise ConnectionError(
                 f"Could not connect to {host}:{port}{via}: {e}"
             ) from e
+
+        if accept_new_host_key:
+            # Trust-on-first-use: remember the key so this host no longer
+            # needs the override and later connections are still verified.
+            await asyncio.to_thread(_remember_client_host_key, client, host, port)
+
+        # Platform detection must happen before any command is wrapped so the
+        # first user command already uses the right grammar.
+        os_family, shell, os_name = await asyncio.to_thread(
+            _probe_remote_platform, client
+        )
 
         info = SSHConnectionInfo(
             client=client,
@@ -220,6 +585,11 @@ class SSHManager:
             jump_port=jump_config.get("port", 22) if jump_config else 22,
             jump_username=jump_config.get("username", "") if jump_config else "",
             profile_id=profile_id,
+            owner=owner,
+            os_family=os_family,
+            accept_new_host_key=accept_new_host_key,
+            remote_os=os_name,
+            remote_shell=shell,
             _connect_params={
                 "host": host,
                 "port": port,
@@ -228,6 +598,8 @@ class SSHManager:
                 "key_path": key_path,
                 "passphrase": passphrase,
                 "profile_id": profile_id,
+                "accept_new_host_key": accept_new_host_key,
+                "owner": owner,
                 "jump_host_id": jump_config.get("id", "") if jump_config else "",
                 "jump_name": jump_config.get("name", "") if jump_config else "",
                 "jump_host": jump_config.get("host", "") if jump_config else "",
@@ -345,6 +717,8 @@ class SSHManager:
             for sid, _info in matches:
                 self._connections.pop(sid, None)
                 self._reconnect_params.pop(sid, None)
+                self._sudo_state.pop(sid, None)
+                self._env_cache.pop(sid, None)
 
         for sid, info in matches:
             try:
@@ -378,6 +752,8 @@ class SSHManager:
             for sid, _info in matches:
                 self._connections.pop(sid, None)
                 self._reconnect_params.pop(sid, None)
+                self._sudo_state.pop(sid, None)
+                self._env_cache.pop(sid, None)
 
         for sid, info in matches:
             try:
@@ -429,6 +805,38 @@ class SSHManager:
         info.last_used = datetime.now(timezone.utc)
         return info
 
+    def get_owner(self, session_id: str) -> str:
+        """Return the auth subject that opened the session.
+
+        Returns ``""`` when the session is unknown or was opened without an
+        identifiable caller (single-user deployments).
+        """
+        info = self._connections.get(session_id)
+        if info is not None:
+            return info.owner
+        params = self._reconnect_params.get(session_id)
+        if params:
+            return str(params.get("owner", ""))
+        return ""
+
+    def can_reconnect(self, session_id: str) -> bool:
+        """True when cached parameters exist for a session with no live link.
+
+        Used to tell "never connected" apart from "connection was lost".
+        """
+        return bool(self._reconnect_params.get(session_id))
+
+    def list_connections_for(self, owner: str) -> list[dict]:
+        """Return sanitized connections belonging to ``owner`` only."""
+        result = []
+        for sid, info in self._connections.items():
+            if info.owner != owner:
+                continue
+            item = info.to_dict()
+            item["session_id"] = sid
+            result.append(item)
+        return result
+
     async def execute_command(
         self,
         session_id: str,
@@ -455,92 +863,54 @@ class SSHManager:
             if sudo_state and sudo_state.password:
                 sudo_password = sudo_state.password
 
-        # Wrap command with cd if cwd is specified
-        effective_cwd = cwd or info.default_cwd
-        inner_cmd = wrap_command_with_cwd(command, effective_cwd, info.remote_shell)
+        if sudo and remote_platform.is_windows(info.os_family):
+            raise ConnectionError(
+                "sudo is not available on Windows remotes. "
+                "Run an elevated command explicitly instead."
+            )
 
-        # Determine remote shell type to apply correct command wrapping.
-        # - sh-compatible shells (bash, zsh, dash, fish): use sh -c to
-        #   ensure consistent parsing of &&, ;, nested quotes across platforms.
-        # - Windows shells (cmd, powershell): send command directly; they have
-        #   their own quoting semantics and no sh -c wrapper.
-        shell = (info.remote_shell or "").lower()
-        is_windows_shell = any(
-            s in shell for s in ("cmd", "powershell", "pwsh")
+        # Wrap the command so it runs in the effective working directory. The
+        # wrapper is platform specific; see remote/platform.py.
+        effective_cwd = cwd or info.default_cwd
+        inner_cmd = remote_platform.build_command(
+            command,
+            effective_cwd,
+            info.os_family,
+            info.remote_shell,
         )
 
         if sudo:
             if not sudo_password:
                 raise ConnectionError(
                     "Sudo password not configured. "
-                    "Use /remote sudo or set sudo password in profile."
+                    "Use /remote set-sudo or POST /api/remote/connections/"
+                    "{session_id}/sudo."
                 )
-            # sudo always needs sh -c, regardless of local shell
+            # sudo always needs a POSIX shell regardless of the login shell
             cmd = f"sudo -S -p '' sh -c {shlex.quote(inner_cmd)}"
-        elif is_windows_shell:
-            # Windows shells: send raw command, no sh -c wrapper
-            cmd = inner_cmd
+            stdin_data = f"{sudo_password}\n"
         else:
-            # Unix shells: use exec_command directly — SSH server invokes the
-            # user's login shell to parse the command string, so wrapping in
-            # sh -c is unnecessary for simple commands and causes quoting
-            # issues (double-shell parsing) for complex ones.
+            # The SSH server hands the string to the remote login shell, which
+            # already owns quoting for its platform. No extra sh -c layer.
             cmd = inner_cmd
+            stdin_data = ""
 
         logger.debug("[Remote] execute_command cmd=%r", cmd)
 
         def _do_exec() -> tuple[int, str, str]:
-            transport = info.client.get_transport()
-            if transport is None:
-                raise ConnectionError("SSH transport is closed")
-
-            channel = transport.open_session()
-            channel.settimeout(timeout)
-            channel.exec_command(cmd)
-
-            # Write sudo password to stdin if needed
-            if sudo and sudo_password:
-                channel.sendall((sudo_password + "\n").encode("utf-8"))
-
-            # Read stdout and stderr
-            stdout_bytes = b""
-            stderr_bytes = b""
-
-            # Read until channel closes
-            channel.shutdown_write()
-
-            import select
-            import time
-
-            start = time.monotonic()
-            while not channel.exit_status_ready():
-                if time.monotonic() - start > timeout:
-                    channel.close()
-                    return (-1, stdout_bytes.decode("utf-8", errors="replace"),
-                            f"Command timed out after {timeout} seconds")
-                readable, _, _ = select.select(
-                    [channel], [], [], min(1.0, timeout)
-                )
-                if readable:
-                    if channel.recv_ready():
-                        stdout_bytes += channel.recv(65536)
-                    if channel.recv_stderr_ready():
-                        stderr_bytes += channel.recv_stderr(65536)
-
-            # Drain remaining data
-            while channel.recv_ready():
-                stdout_bytes += channel.recv(65536)
-            while channel.recv_stderr_ready():
-                stderr_bytes += channel.recv_stderr(65536)
-
-            returncode = channel.recv_exit_status()
-            channel.close()
-
-            return (
-                returncode,
-                stdout_bytes.decode("utf-8", errors="replace"),
-                stderr_bytes.decode("utf-8", errors="replace"),
+            _rc, stdout, stderr, timed_out = _run_on_client(
+                info.client,
+                cmd,
+                timeout,
+                stdin_data=stdin_data,
             )
+            if timed_out:
+                return (
+                    -1,
+                    stdout,
+                    f"Command timed out after {timeout} seconds",
+                )
+            return _rc, stdout, stderr
 
         try:
             return await asyncio.to_thread(_do_exec)
@@ -623,6 +993,8 @@ class SSHManager:
                 )
             self._connections.clear()
             self._reconnect_params.clear()
+            self._sudo_state.clear()
+            self._env_cache.clear()
 
     def list_connections(self) -> list[dict]:
         """Return sanitized info for all active connections."""
@@ -632,6 +1004,20 @@ class SSHManager:
             d["session_id"] = sid
             result.append(d)
         return result
+
+    async def _verify_cwd(self, session_id: str, info: SSHConnectionInfo) -> bool:
+        """Check that the default working directory is reachable."""
+        probe = remote_platform.working_directory_probe(
+            info.os_family, info.remote_shell
+        )
+        try:
+            _rc, stdout, _stderr = await self.execute_command(
+                session_id, probe, timeout=5
+            )
+        except Exception as exc:
+            logger.debug("[Remote] Working directory probe failed: %s", exc)
+            return False
+        return bool(stdout.strip())
 
     # ── Heartbeat ────────────────────────────────────────────────────
 
@@ -720,13 +1106,7 @@ class SSHManager:
 
             # Deep check: verify cwd accessibility
             if deep_check and sid not in stale:
-                try:
-                    _, stdout, _ = await self.execute_command(
-                        sid, "pwd", timeout=5
-                    )
-                    info.health.cwd_ok = bool(stdout.strip())
-                except Exception:
-                    info.health.cwd_ok = False
+                info.health.cwd_ok = await self._verify_cwd(sid, info)
 
         if stale:
             async with self._lock:
@@ -884,28 +1264,12 @@ class SSHManager:
                 info.health.connected = True
 
         # Deep check: verify cwd
-        try:
-            _, stdout, _ = await self.execute_command(session_id, "pwd", timeout=5)
-            info.health.cwd_ok = bool(stdout.strip())
-        except Exception:
-            info.health.cwd_ok = False
+        info.health.cwd_ok = await self._verify_cwd(session_id, info)
 
         info.health.reconnect_available = True
         return info.health.to_dict()
 
     # ── Remote Environment Detection ────────────────────────────────
-
-    _ENV_DETECT_SCRIPT = r"""printf 'os=%s\n' "$(uname -s 2>/dev/null)"
-printf 'arch=%s\n' "$(uname -m 2>/dev/null)"
-printf 'kernel=%s\n' "$(uname -r 2>/dev/null)"
-printf 'shell=%s\n' "$SHELL"
-printf 'hostname=%s\n' "$(hostname 2>/dev/null)"
-printf 'cpu=%s\n' "$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo '')"
-printf 'memory=%s\n' "$(free -h 2>/dev/null | awk '/^Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.1fG", $1/1073741824}' || echo '')"
-printf 'disk_root=%s\n' "$(df -h / 2>/dev/null | awk 'NR==2{print $2 " total, " $3 " used, " $4 " avail"}')"
-for t in git python3 python node npm docker curl wget vim nano; do
-  command -v "$t" >/dev/null 2>&1 && echo "tool_$t=1" || echo "tool_$t=0"
-done"""
 
     _ENV_KEY_TO_FIELD = {
         "os": "remote_os",
@@ -939,22 +1303,26 @@ done"""
         return snapshot
 
     async def _detect_remote_env(self, session_id: str) -> RemoteEnvSnapshot:
-        """Detect remote environment using a single SSH command."""
+        """Detect remote environment using a single platform-specific command."""
         info = self.get_connection(session_id)
         if info is None:
             return RemoteEnvSnapshot(last_error="No active connection")
 
         snapshot = RemoteEnvSnapshot(detected_at=datetime.now(timezone.utc))
+        script = remote_platform.environment_script(
+            info.os_family, info.remote_shell
+        )
 
         try:
             returncode, stdout, stderr = await self.execute_command(
-                session_id, self._ENV_DETECT_SCRIPT, timeout=15
+                session_id, script, timeout=15
             )
             if returncode != 0 and not stdout:
                 snapshot.last_error = stderr.strip() or "Detection script failed"
                 return snapshot
 
             tools: dict[str, bool] = {}
+            detected_shell = ""
             for line in stdout.splitlines():
                 line = line.strip()
                 if "=" not in line:
@@ -964,12 +1332,22 @@ done"""
                 value = value.strip()
 
                 if key.startswith("tool_"):
-                    tool_name = key[5:]
-                    tools[tool_name] = value == "1"
+                    tools[key[5:]] = value == "1"
                 elif key in self._ENV_KEY_TO_FIELD:
+                    if key == "shell":
+                        detected_shell = value
                     setattr(snapshot, self._ENV_KEY_TO_FIELD[key], value)
 
-            snapshot.tools = tools
+            # The scripts only report tools they found, so fill the gaps.
+            snapshot.tools = {
+                name: tools.get(name, False)
+                for name in remote_platform.DETECTED_TOOLS
+            }
+            # Platform detection already established a shell; only trust the
+            # probe when it produced something usable.
+            if not detected_shell:
+                snapshot.remote_shell = info.remote_shell
+
             # Also update connection info
             info.remote_os = snapshot.remote_os
             info.remote_arch = snapshot.remote_arch
@@ -1006,14 +1384,14 @@ done"""
         jump_password: str = "",
         jump_key_path: str = "",
         jump_passphrase: str = "",
+        accept_new_host_key: bool = False,
     ) -> dict:
         """Test an SSH connection without affecting current sessions.
 
-        Returns dict with latency_ms, remote_os, remote_shell on success.
-        Raises on failure.
+        Returns dict with latency_ms, os_family, remote_os and remote_shell
+        on success. Raises on failure.
         """
         import paramiko
-        import time as _time
 
         host, port = normalize_host_and_port(host, port)
         if not host:
@@ -1032,68 +1410,20 @@ done"""
             jump_passphrase=jump_passphrase,
         )
 
-        def _build_connect_kwargs(
-            *,
-            hostname: str,
-            port: int,
-            username: str,
-            password: str = "",
-            key_path: str = "",
-            passphrase: str = "",
-            sock: object | None = None,
-        ) -> dict:
-            connect_kwargs: dict[str, Any] = {
-                "hostname": hostname,
-                "port": port,
-                "username": username,
-                "timeout": 15,
-            }
-            if password:
-                connect_kwargs["password"] = password
-            if key_path:
-                connect_kwargs["key_filename"] = key_path
-            if passphrase:
-                connect_kwargs["passphrase"] = passphrase
-            if sock is not None:
-                connect_kwargs["sock"] = sock
-            return connect_kwargs
-
-        def _new_client() -> paramiko.SSHClient:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            return client
-
         def _do_test() -> dict:
             jump_client = None
             sock = None
             if jump_config:
-                jump_client = _new_client()
-                try:
-                    jump_client.connect(
-                        **_build_connect_kwargs(
-                            hostname=jump_config["host"],
-                            port=jump_config["port"],
-                            username=jump_config["username"],
-                            password=jump_config.get("password", ""),
-                            key_path=jump_config.get("key_path", ""),
-                            passphrase=jump_config.get("passphrase", ""),
-                        )
-                    )
-                    transport = jump_client.get_transport()
-                    if transport is None or not transport.is_active():
-                        raise ConnectionError("Jump host SSH transport is closed")
-                    sock = transport.open_channel(
-                        "direct-tcpip",
-                        (host, port),
-                        ("", 0),
-                    )
-                except Exception:
-                    jump_client.close()
-                    raise
+                jump_client, sock = _open_jump_socket(
+                    jump_config,
+                    host,
+                    port,
+                    accept_new_host_key,
+                )
 
-            client = _new_client()
+            client = _new_client(accept_new_host_key)
             try:
-                t0 = _time.monotonic()
+                start = time.monotonic()
                 client.connect(
                     **_build_connect_kwargs(
                         hostname=host,
@@ -1105,37 +1435,17 @@ done"""
                         sock=sock,
                     )
                 )
-                latency_ms = round((_time.monotonic() - t0) * 1000, 1)
-
-                # Quick env detection
-                transport = client.get_transport()
-                channel = transport.open_session()
-                channel.exec_command(
-                    "uname -s; echo $SHELL"
+                latency_ms = round((time.monotonic() - start) * 1000, 1)
+                if accept_new_host_key:
+                    _remember_client_host_key(client, host, port)
+                os_family, shell, os_name = _probe_remote_platform(
+                    client, timeout=10
                 )
-                channel.shutdown_write()
-                output_bytes = b""
-                start = _time.monotonic()
-                while not channel.exit_status_ready():
-                    if _time.monotonic() - start > 5:
-                        channel.close()
-                        break
-                    if channel.recv_ready():
-                        output_bytes += channel.recv(65536)
-                    _time.sleep(0.05)
-                while channel.recv_ready():
-                    output_bytes += channel.recv(65536)
-                output = output_bytes.decode("utf-8", errors="replace")
-                channel.close()
-
-                lines = output.strip().split("\n")
-                remote_os = lines[0].strip() if len(lines) > 0 else ""
-                remote_shell = lines[1].strip() if len(lines) > 1 else ""
-
                 return {
                     "latency_ms": latency_ms,
-                    "remote_os": remote_os,
-                    "remote_shell": remote_shell,
+                    "os_family": os_family,
+                    "remote_os": os_name,
+                    "remote_shell": shell,
                 }
             finally:
                 client.close()
@@ -1144,6 +1454,10 @@ done"""
 
         try:
             return await asyncio.to_thread(_do_test)
+        except paramiko.BadHostKeyException as e:
+            raise ConnectionError(
+                _host_key_mismatch_message(host, port, e)
+            ) from e
         except paramiko.AuthenticationException as e:
             raise ConnectionError(
                 f"Authentication failed for {username}@{host}:{port}. "
@@ -1151,7 +1465,8 @@ done"""
             ) from e
         except paramiko.SSHException as e:
             raise ConnectionError(
-                f"SSH error connecting to {host}:{port}: {e}"
+                _host_key_error_message(e)
+                or f"SSH error connecting to {host}:{port}: {e}"
             ) from e
         except (OSError, ConnectionError, TimeoutError) as e:
             raise ConnectionError(
@@ -1182,7 +1497,9 @@ done"""
         cwd = cwd.strip()
 
         if verify:
-            test_cmd = "pwd"
+            test_cmd = remote_platform.working_directory_probe(
+                info.os_family, info.remote_shell
+            )
             try:
                 returncode, stdout, stderr = await self.execute_command(
                     session_id, test_cmd, timeout=5, cwd=cwd

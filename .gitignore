@@ -15,6 +15,9 @@ Thumbs.db
 
 *.zip
 
+.pytest_cache/
+.pytest-working-dir/
 
 # Code Agents
 .mimocode/
+.kagent/
