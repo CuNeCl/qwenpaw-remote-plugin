@@ -27,6 +27,7 @@ async def remote_connect(
     jump_key_path: str = "",
     jump_passphrase: str = "",
     accept_new_host_key: bool = False,
+    shell: str = "",
 ) -> ToolResponse:
     """Connect to a remote device via SSH.
 
@@ -51,6 +52,10 @@ async def remote_connect(
         accept_new_host_key: Trust an unknown remote host key on first
             connect. Disabled by default; only enable it after verifying
             the host fingerprint.
+        shell: Pin the shell executable that decides the command grammar,
+            e.g. '/bin/zsh', 'powershell.exe', 'cmd.exe' or a Git Bash
+            path. Empty (default) auto-detects: $SHELL first, then the
+            platform default (/bin/sh on POSIX, cmd.exe on Windows).
 
     Returns:
         ToolResponse with connection status.
@@ -99,6 +104,7 @@ async def remote_connect(
             jump_key_path=jump_key_path,
             jump_passphrase=jump_passphrase,
             accept_new_host_key=accept_new_host_key,
+            shell=shell,
         )
     except (ConnectionError, ValueError) as e:
         return ToolResponse(

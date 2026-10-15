@@ -26,7 +26,7 @@ QwenPaw 2.0+ 插件，为聊天会话提供透明的 SSH 远程执行能力。�
 plugin.py              → 插件系统后端入口 shim（导出 remote.plugin.plugin）
 remote/plugin.py       → 后端实现入口（注册 tools、command、middleware、router、shutdown hook）
 remote/context.py      → ContextVar，中间件用它把 session_id 传给 remote_* 工具
-remote/platform.py     → POSIX / Windows 平台抽象：命令包装、路径引用、工作目录探测、环境脚本
+remote/platform.py     → POSIX / Windows 平台抽象：语法族分类、命令包装、路径引用、工作目录探测、环境脚本
 remote/ssh_types.py    → SSH 数据结构、健康状态、环境快照
 remote/ssh_manager.py  → 单例 SSH 连接管理器（paramiko）
 remote/shell_wrapper.py → AgentScope MiddlewareBase：拦截 shell 命令 → SSH 执行
@@ -43,6 +43,7 @@ tests/                 → 回归测试（platform、store、host key、pending 
 - **ContextVar 传递 session_id**：`remote/context.py` 持有 `ContextVar[str | None]`，由中间件在每次请求中 set/reset，调用栈深处的 remote_* 工具无需显式传参即可拿到当前 session ID。
 - **异步生成器中间件**：`remote/shell_wrapper.py` 在检测到活跃 SSH 连接时拦截 `execute_shell_command`；若连接曾存在但已失效，则阻断执行并提示重连（不得静默回退本地）。
 - **平台分支集中**：任何 shell 语法差异都必须放进 `remote/platform.py`（命令包装、路径引用、探测命令、环境脚本），`SSHManager` 不判断平台。
+- **Shell 可执行程序可指定**：`shell` 沿 profile 的 `default_shell` → `connect()` / `test_connection()` → `_probe_remote_platform()` 传递，并写进 `_connect_params` 供重连复用。回退链为「指定值 → 远端 `$SHELL` → 平台默认（`POSIX_DEFAULT_SHELL` / `WINDOWS_DEFAULT_SHELL`）」；指定值非空时跳过 Windows 的 `echo %COMSPEC%` 差分探测。`platform.classify_shell_grammar(shell, os_family)` 决定包装语法族：`powershell`/`pwsh` → PowerShell，`cmd` → cmd，其余（bash/zsh/fish/Git Bash，经 `shell_basename()` 取文件名）→ posix；POSIX 远端恒为 posix。命令包装、cwd 探测、环境脚本三处都按该语法族分发，`os_family` 只用于 sudo 判断与平台探测。**该设置只决定语法，不显式调用解释器**，故所选 shell 必须与远端登录 shell 一致。
 - **单例 `SSHManager`**：所有连接以 `session_id` 为键。负责跳板机隧道、主机密钥策略、健康检查、命令超时、环境探测缓存。
 - **前端宿主 API**：React、ReactDOM、Ant Design 由宿主通过 `window.QwenPaw.host` 提供，不要直接 import。注册扩展只用文档化的 `window.QwenPaw.route/menu/slot/chat.*`。**请求不要用 `host.fetch`**：实测某些宿主版本会忽略 `options.method`，把 POST/PATCH 静默变成 GET（表现是写操作「成功」但实际未生效，或返回 405）。统一走 `apiFetch()`，它用 `host.getApiUrl(path)` + 原生 `fetch` 显式传 method，并手工补 `Authorization` 与 `X-Agent-Id` 头。
 - **session id 解析**：`getSessionId()` 返回 `string | null`，按 `host.getCurrentSessionId()` → `window.currentSessionId`/`window.sessionId` → `chat.requestPayload` 回调缓存 → `/connections/active` 探测缓存的顺序探测。**不得再造共享兜底 id**（曾用 `"default-session"`，会导致跨会话串号）。轮询循环（5s/10s）静默使用，不做弹窗；只有用户主动操作才用 `requireSessionId(zh, sessionId)` 提示一次。
@@ -71,6 +72,7 @@ tests/                 → 回归测试（platform、store、host key、pending 
 - `SSHManager` 通过 `__new__` 实现单例 — 不要期望多次实例化能获得隔离。
 - 跳板机连接会创建嵌套 transport 链；必须按正确顺序断开（由 `SSHManager.disconnect()` 管理）。
 - `PUT /profiles/{id}` 是**全量替换**语义：局部字段修改必须走专用函数（如 `store.update_profile_cwd`），否则会把 host/username/key_path 重置为默认值。
+- `store._normalize_profile_payload` 按**固定字段逐个构造** profile：新增 profile 字段（如 `default_shell`）必须同步加进该函数，否则前端提交的值会被静默丢弃——接口返回正常但功能不生效。
 - 未知主机密钥默认 `RejectPolicy` 拒绝。显式信任（profile 开关 / `remote_connect(accept_new_host_key=True)` / `/remote connect accept_new_host_key=true` / 前端「信任并重试」）会通过 `_remember_host_key` **一次性写入 `WORKING_DIR/remote/known_hosts`**（TOFU），之后连接照常严格校验；密钥不一致时抛 `BadHostKeyException` → `_host_key_mismatch_message`，**绝不允许自动信任**。`_load_known_hosts` 同时加载系统/用户/插件三处 known_hosts。
 - sudo 密码来自 profile 的 `sudo_password` 或会话级配置接口，**不要**回退到 SSH 登录密码。Windows 远端不支持 sudo。
 - 会话级 API 会校验调用方主体（`X-Agent-Id` / `X-User-Id`）；新增会话级路由时需调用 `_assert_session_owner`。

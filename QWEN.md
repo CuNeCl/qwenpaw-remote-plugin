@@ -23,7 +23,7 @@ plugin.py (根入口 shim，负责在隔离加载环境下定位后端包)
     └── register_shutdown_hook() → 关闭全部 SSH 连接
 
 remote/ssh_manager.py (SSH 连接单例，按 session_id 管理；心跳、健康检查、跳板机、sudo、环境探测)
-remote/platform.py (POSIX / Windows 平台抽象：命令包装、路径引用、探测与环境脚本)
+remote/platform.py (POSIX / Windows 平台抽象：语法族分类、命令包装、路径引用、探测与环境脚本)
 remote/ssh_types.py (SSH 数据结构与健康状态)
 remote/context.py (ContextVar：中间件向 remote_* 工具传递 session_id)
 remote/store.py (持久化连接配置/跳板机到 profiles.json，原子写入)
@@ -38,7 +38,7 @@ ui/src/index.ts (单文件 React 前端，通过 window.QwenPaw.* 注册路由/�
 | `plugin.py` | 插件系统入口 shim，导出 `remote.plugin.plugin` |
 | `remote/plugin.py` | 后端实现入口，注册 tools / command / middleware / router / shutdown hook |
 | `remote/ssh_manager.py` | SSH 连接管理器单例，支持密码/密钥认证及跳板机，基于 paramiko |
-| `remote/platform.py` | 远端平台抽象：命令包装、路径引用、工作目录探测、环境探测脚本 |
+| `remote/platform.py` | 远端平台抽象：shell 语法族分类、命令包装、路径引用、工作目录探测、环境探测脚本 |
 | `remote/ssh_types.py` | SSH 连接数据结构、健康状态、环境快照 |
 | `remote/context.py` | ContextVar，用于把中间件解析出的 session_id 传给 remote_* 工具 |
 | `remote/shell_wrapper.py` | AgentScope MiddlewareBase，拦截 `execute_shell_command` 并转发到 SSH |
@@ -54,6 +54,7 @@ ui/src/index.ts (单文件 React 前端，通过 window.QwenPaw.* 注册路由/�
 - 连接配置持久化（Profiles），sudo 密码独立于 SSH 密码
 - 透明 shell 命令转发；连接失效时阻断本地执行
 - POSIX / Windows 远端自动探测与平台适配
+- 远端 shell 可指定（profile 的 `default_shell` / 连接的 `shell`）：留空自动探测（`$SHELL` → 平台默认），非空时由 `classify_shell_grammar()` 分类出 posix / powershell / cmd 语法并跳过 Windows 的 `%COMSPEC%` 探测
 - `/remote` 对话命令
 - 前端连接管理页面与 header 状态浮层
 - 会话归属校验（基于宿主注入的身份头）；`/connections/active` 按调用方主体解析活跃连接
@@ -119,6 +120,7 @@ python -m pytest tests -q
 - **日志前缀：** 日志使用 `[Remote]` 前缀
 - **敏感字段处理：** 响应中必须移除 `password` / `passphrase` / `sudo_password`（`_sanitize_secret_fields`）
 - **配置持久化：** 存储到 `WORKING_DIR/remote/profiles.json`，原子写入；更新时保留未提供的敏感字段
+- **profile 字段白名单：** `store._normalize_profile_payload` 逐字段构造 profile，新增字段（如 `default_shell`）必须显式加入，否则提交的值会被静默丢弃
 - **profile 更新语义：** `PUT /profiles/{id}` 是全量替换；局部修改必须走专用函数（如 `update_profile_cwd`），不要把增量 payload 交给 `update_profile`
 - **前端请求约定：** 不要用 `host.fetch`（部分宿主版本会忽略 `options.method`，把 POST/PATCH 静默变成 GET）；统一走 `apiFetch()`，用 `host.getApiUrl()` + 原生 `fetch` 显式传 method，并补 `Authorization` / `X-Agent-Id` 头
 - **session id 约定：** `getSessionId()` 返回 `string | null`，按宿主 API → 全局变量 → `chat.requestPayload` 回调缓存 → `/connections/active` 探测的顺序解析；不得使用共享兜底 id（会造成跨会话串号）。轮询路径静默处理，只有用户主动操作才提示

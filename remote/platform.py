@@ -82,6 +82,58 @@ def detect_windows_shell(stdout: str) -> str:
     return SHELL_CMD
 
 
+#: Shell executables used when nothing else is available.
+POSIX_DEFAULT_SHELL = "/bin/sh"
+WINDOWS_DEFAULT_SHELL = "cmd.exe"
+
+#: Command-grammar families. Command wrapping, the cwd probe and the
+#: environment-detection scripts dispatch on these instead of on
+#: ``os_family``, so a shell pinned by the user decides the syntax.
+GRAMMAR_POSIX = "posix"
+GRAMMAR_POWERSHELL = SHELL_POWERSHELL
+GRAMMAR_CMD = SHELL_CMD
+
+_POWERSHELL_BASENAMES = ("powershell", "pwsh")
+_CMD_BASENAMES = ("cmd",)
+
+
+def shell_basename(shell: str) -> str:
+    """Return the lowercased executable name of a shell path.
+
+    Handles both POSIX and Windows separators and drops the ``.exe`` suffix,
+    so ``C:\\Program Files\\Git\\bin\\bash.exe`` yields ``bash``.
+    """
+    value = str(shell or "").strip().strip('"')
+    for separator in ("\\", "/"):
+        if separator in value:
+            value = value.rsplit(separator, 1)[-1]
+    if value.lower().endswith(".exe"):
+        value = value[: -len(".exe")]
+    return value.strip().lower()
+
+
+def classify_shell_grammar(shell: str, os_family: str) -> str:
+    """Map a shell executable to the command grammar it understands.
+
+    ``os_family`` is the fallback when ``shell`` cannot be classified. A
+    POSIX remote always maps to :data:`GRAMMAR_POSIX`, since Windows shells
+    are meaningless there.
+    """
+    if not is_windows(os_family):
+        return GRAMMAR_POSIX
+
+    basename = shell_basename(shell)
+    if basename in _POWERSHELL_BASENAMES:
+        return GRAMMAR_POWERSHELL
+    if basename in _CMD_BASENAMES:
+        return GRAMMAR_CMD
+    if basename:
+        # bash / zsh / fish / Git Bash and friends all speak POSIX syntax.
+        return GRAMMAR_POSIX
+    # Unset: keep the conservative Windows default.
+    return GRAMMAR_CMD
+
+
 def is_windows(os_family: str) -> bool:
     return os_family == WINDOWS
 
@@ -124,40 +176,44 @@ def quote_cmd_path(path: str) -> str:
 def _build_posix_command(command: str, cwd: str, shell: str) -> str:
     if not cwd or cwd == "/":
         return command
-    separator = "; and " if "fish" in (shell or "").lower() else " && "
+    separator = "; and " if shell_basename(shell) == "fish" else " && "
     return f"cd {quote_posix_path(cwd)}{separator}{command}"
 
 
-def _build_windows_command(command: str, cwd: str, shell: str) -> str:
-    """Wrap a command so the remote Windows login shell can run it.
+def _build_powershell_command(command: str, cwd: str) -> str:
+    if not cwd:
+        return command
+    return f"Set-Location -LiteralPath {quote_powershell_literal(cwd)}; {command}"
 
-    The remote shell already owns the command's quoting, so the wrapper
-    always uses that shell's own syntax.
-    """
-    if shell == SHELL_POWERSHELL:
-        if not cwd:
-            return command
-        return f"Set-Location -LiteralPath {quote_powershell_literal(cwd)}; {command}"
 
+def _build_cmd_command(command: str, cwd: str) -> str:
     if not cwd:
         return command
     return f"cd /d {quote_cmd_path(cwd)} && {command}"
 
 
 def build_command(command: str, cwd: str, os_family: str, shell: str) -> str:
-    """Wrap ``command`` so it runs in ``cwd`` on the detected platform."""
-    if is_windows(os_family):
-        return _build_windows_command(command, cwd, shell)
+    """Wrap ``command`` so it runs in ``cwd`` using the shell's grammar.
+
+    The remote login shell owns the command's quoting, so the wrapper always
+    uses that shell's own syntax; ``shell`` only decides which syntax that is.
+    """
+    grammar = classify_shell_grammar(shell, os_family)
+    if grammar == GRAMMAR_POWERSHELL:
+        return _build_powershell_command(command, cwd)
+    if grammar == GRAMMAR_CMD:
+        return _build_cmd_command(command, cwd)
     return _build_posix_command(command, cwd, shell)
 
 
 def working_directory_probe(os_family: str, shell: str) -> str:
     """Command that prints the effective working directory."""
-    if not is_windows(os_family):
-        return "pwd"
-    if shell == SHELL_POWERSHELL:
+    grammar = classify_shell_grammar(shell, os_family)
+    if grammar == GRAMMAR_POWERSHELL:
         return "(Get-Location).Path"
-    return "echo %CD%"
+    if grammar == GRAMMAR_CMD:
+        return "echo %CD%"
+    return "pwd"
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +269,10 @@ _CMD_ENV_SCRIPT = " & ".join(
 
 
 def environment_script(os_family: str, shell: str) -> str:
-    """Return the environment-detection script for the remote platform."""
-    if not is_windows(os_family):
-        return _POSIX_ENV_SCRIPT
-    if shell == SHELL_POWERSHELL:
+    """Return the environment-detection script for the remote shell."""
+    grammar = classify_shell_grammar(shell, os_family)
+    if grammar == GRAMMAR_POWERSHELL:
         return _POWERSHELL_ENV_SCRIPT
-    return _CMD_ENV_SCRIPT
+    if grammar == GRAMMAR_CMD:
+        return _CMD_ENV_SCRIPT
+    return _POSIX_ENV_SCRIPT

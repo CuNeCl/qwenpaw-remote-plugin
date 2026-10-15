@@ -44,6 +44,15 @@ class ConnectRequest(BaseModel):
             "Disabled by default to prevent man-in-the-middle attacks."
         ),
     )
+    shell: str = Field(
+        default="",
+        description=(
+            "Pin the shell executable that decides the command grammar, "
+            "e.g. '/bin/zsh', 'powershell.exe', 'cmd.exe' or a Git Bash "
+            "path. Empty (default) auto-detects: $SHELL first, then the "
+            "platform default (/bin/sh on POSIX, cmd.exe on Windows)."
+        ),
+    )
 
 
 class ProfileRequest(BaseModel):
@@ -76,6 +85,15 @@ class ProfileRequest(BaseModel):
         description=(
             "Trust an unknown remote host key on first connect. "
             "Disabled by default to prevent man-in-the-middle attacks."
+        ),
+    )
+    default_shell: str = Field(
+        default="",
+        description=(
+            "Default shell executable for this profile, e.g. '/bin/bash', "
+            "'/bin/zsh', 'powershell.exe', 'pwsh.exe' or a Git Bash path. "
+            "Empty (default) auto-detects: $SHELL first, then the platform "
+            "default (/bin/sh on POSIX, cmd.exe on Windows)."
         ),
     )
 
@@ -146,6 +164,14 @@ class ProfileTestRequest(BaseModel):
     accept_new_host_key: bool = Field(
         default=False,
         description="Trust an unknown remote host key on first connect.",
+    )
+    shell: str = Field(
+        default="",
+        description=(
+            "Pin the shell executable that decides the command grammar. "
+            "Empty (default) auto-detects: $SHELL first, then the platform "
+            "default (/bin/sh on POSIX, cmd.exe on Windows)."
+        ),
     )
 
 

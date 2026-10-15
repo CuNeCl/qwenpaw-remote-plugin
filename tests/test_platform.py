@@ -29,6 +29,41 @@ def test_detect_windows_shell():
     assert p.detect_windows_shell("") == p.SHELL_CMD
 
 
+def test_shell_basename():
+    assert p.shell_basename("/bin/zsh") == "zsh"
+    assert p.shell_basename("/usr/bin/fish") == "fish"
+    assert p.shell_basename("powershell.exe") == "powershell"
+    assert p.shell_basename("PWSH.EXE") == "pwsh"
+    assert p.shell_basename("C:\\Program Files\\Git\\bin\\bash.exe") == "bash"
+    assert p.shell_basename('"/bin/bash"') == "bash"
+    assert p.shell_basename("") == ""
+    assert p.shell_basename(None) == ""
+
+
+def test_classify_shell_grammar():
+    # A POSIX remote always speaks POSIX syntax, whatever is pinned.
+    assert p.classify_shell_grammar("powershell.exe", p.POSIX) == p.GRAMMAR_POSIX
+    assert p.classify_shell_grammar("", p.POSIX) == p.GRAMMAR_POSIX
+
+    assert p.classify_shell_grammar("cmd.exe", p.WINDOWS) == p.GRAMMAR_CMD
+    assert p.classify_shell_grammar("cmd", p.WINDOWS) == p.GRAMMAR_CMD
+    assert (
+        p.classify_shell_grammar("powershell.exe", p.WINDOWS)
+        == p.GRAMMAR_POWERSHELL
+    )
+    assert p.classify_shell_grammar("pwsh.exe", p.WINDOWS) == p.GRAMMAR_POWERSHELL
+    # Anything else on Windows (Git Bash, bash.exe, ...) speaks POSIX syntax.
+    assert (
+        p.classify_shell_grammar(
+            "C:\\Program Files\\Git\\bin\\bash.exe", p.WINDOWS
+        )
+        == p.GRAMMAR_POSIX
+    )
+    # Unset keeps the conservative Windows default.
+    assert p.classify_shell_grammar("", p.WINDOWS) == p.GRAMMAR_CMD
+    assert p.classify_shell_grammar(None, p.WINDOWS) == p.GRAMMAR_CMD
+
+
 # ── POSIX command wrapping ─────────────────────────────────────────────
 
 def test_posix_no_cwd_returns_command():
@@ -94,6 +129,23 @@ def test_windows_powershell_without_cwd():
     assert p.build_command("dir", "", p.WINDOWS, p.SHELL_POWERSHELL) == "dir"
 
 
+def test_pinned_shell_selects_the_windows_grammar():
+    """One Windows remote wraps differently per pinned shell executable."""
+    git_bash = "C:\\Program Files\\Git\\bin\\bash.exe"
+    assert (
+        p.build_command("ls", "C:\\app", p.WINDOWS, git_bash)
+        == "cd 'C:\\app' && ls"
+    )
+    assert (
+        p.build_command("dir", "C:\\app", p.WINDOWS, "cmd.exe")
+        == 'cd /d "C:\\app" && dir'
+    )
+    assert (
+        p.build_command("ls", "C:\\app", p.WINDOWS, "pwsh.exe")
+        == "Set-Location -LiteralPath 'C:\\app'; ls"
+    )
+
+
 # ── Working directory probe ────────────────────────────────────────────
 
 @pytest.mark.parametrize(
@@ -102,6 +154,8 @@ def test_windows_powershell_without_cwd():
         (p.POSIX, "/bin/bash", "pwd"),
         (p.WINDOWS, p.SHELL_POWERSHELL, "(Get-Location).Path"),
         (p.WINDOWS, p.SHELL_CMD, "echo %CD%"),
+        # A POSIX shell pinned on a Windows remote probes with `pwd`.
+        (p.WINDOWS, "C:\\Program Files\\Git\\bin\\bash.exe", "pwd"),
     ],
 )
 def test_working_directory_probe(os_family, shell, expected):
@@ -115,6 +169,14 @@ def test_posix_env_script():
     assert "uname -s" in script
     assert 'command -v "$t"' in script
     assert "tool_$t=1" in script
+
+
+def test_git_bash_env_script_reuses_the_posix_script():
+    script = p.environment_script(
+        p.WINDOWS, "C:\\Program Files\\Git\\bin\\bash.exe"
+    )
+    assert "uname -s" in script
+    assert 'command -v "$t"' in script
 
 
 def test_cmd_env_script():

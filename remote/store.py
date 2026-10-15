@@ -117,6 +117,9 @@ def _normalize_profile_payload(
     profile["default_cwd"] = str(payload.get("default_cwd", "")).strip()
     profile["accept_new_host_key"] = bool(payload.get("accept_new_host_key", False))
     profile["sudo_password"] = str(payload.get("sudo_password", ""))
+    # Pinned shell executable ("/bin/zsh", "powershell.exe", ...). Empty means
+    # auto-detect: $SHELL first, then the platform default.
+    profile["default_shell"] = str(payload.get("default_shell", "")).strip()
 
     if existing is not None:
         for secret in ("password", "passphrase", "sudo_password"):

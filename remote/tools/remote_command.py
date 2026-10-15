@@ -33,10 +33,7 @@ class RemoteCommandHandler(BaseControlCommandHandler):
     """
 
     command_name = "remote"
-    help_text = (
-        "Manage the current remote SSH session and execute commands on the "
-        "remote machine"
-    )
+    help_text = "管理当前会话的远程 SSH 连接，并在远端机器上执行命令"
 
     async def handle(self, ctx, args: str):
         """Entry point invoked by the QwenPaw control command dispatcher."""
@@ -146,6 +143,7 @@ class RemoteCommandHandler(BaseControlCommandHandler):
                 accept_new_host_key=_as_bool(
                     parsed.get("accept_new_host_key", "")
                 ),
+                shell=parsed.get("shell", ""),
             )
         except (ConnectionError, ValueError) as exc:
             return f"Remote connection failed: {exc}"
@@ -369,6 +367,7 @@ class RemoteCommandHandler(BaseControlCommandHandler):
             "`/remote connect <user>@<host> jump_name=<name>` - Connect through a saved jump host\n"
             "`/remote connect <user>@<host> jump_host=<host> jump_username=<user>` - Connect through an inline jump host\n"
             "`/remote connect <user>@<host> accept_new_host_key=true` - Trust an unknown host key\n"
+            "`/remote connect <user>@<host> shell=/bin/zsh` - Pin the shell executable (decides the command grammar)\n"
             "`/remote disconnect` - Disconnect current session\n"
             "`/remote reconnect` - Reconnect using cached parameters\n"
             "`/remote cd <path>` - Set default working directory\n"

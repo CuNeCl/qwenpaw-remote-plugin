@@ -37,6 +37,7 @@ function buildPlugin() {
     Space,
     Button,
     Input,
+    AutoComplete,
     Select,
     Form,
     Modal,
@@ -878,6 +879,7 @@ function buildPlugin() {
         sudo_password: "",
         jump_host_id: profile.jump_host_id || "",
         default_cwd: profile.default_cwd || "",
+        default_shell: profile.default_shell || "",
         accept_new_host_key: Boolean(profile.accept_new_host_key),
       });
       setModalOpen(true);
@@ -1509,6 +1511,32 @@ function buildPlugin() {
                 : "Unknown host keys are rejected by default to prevent man-in-the-middle attacks. Enable only after verifying the host fingerprint.",
             },
             React.createElement(Switch),
+          ),
+          React.createElement(
+            Form.Item,
+            {
+              name: "default_shell",
+              label: zh ? "Shell 可执行程序" : "Shell Executable",
+              initialValue: "",
+              tooltip: zh
+                ? "决定远端命令使用的 shell 语法。可填 /bin/bash、/bin/zsh、powershell.exe、pwsh.exe 或 Git Bash 等路径；留空表示自动探测（先取 $SHELL，再回退到平台默认值：Unix 为 /bin/sh，Windows 为 cmd.exe）。注意：所选 shell 需与远端登录 shell 一致，否则命令语法不匹配会执行失败。"
+                : "Decides the shell grammar used for remote commands. Enter a path such as /bin/bash, /bin/zsh, powershell.exe, pwsh.exe or Git Bash. Leave empty to auto-detect ($SHELL first, then the platform default: /bin/sh on Unix, cmd.exe on Windows). The pinned shell must match the remote login shell, or the command grammar will mismatch.",
+            },
+            React.createElement(AutoComplete, {
+              allowClear: true,
+              style: { width: "100%" },
+              placeholder: zh
+                ? "留空 = 自动探测（/bin/sh、cmd.exe 等）"
+                : "Empty = auto-detect (/bin/sh, cmd.exe, ...)",
+              options: [
+                { value: "/bin/bash" },
+                { value: "/bin/zsh" },
+                { value: "/bin/sh" },
+                { value: "cmd.exe" },
+                { value: "powershell.exe" },
+                { value: "pwsh.exe" },
+              ],
+            }),
           ),
           React.createElement(
             Form.Item,

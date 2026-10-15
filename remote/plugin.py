@@ -36,9 +36,8 @@ class RemotePlugin:
             tool_name="remote_connect",
             tool_func=remote_connect,
             description=(
-                "Connect to a remote device via SSH. After connecting, "
-                "all shell commands in this conversation will execute "
-                "on the remote machine."
+                "通过 SSH 连接远端设备。连接后，本会话内的所有 shell 命令"
+                "都会在远端机器上执行。"
             ),
             icon="🔗",
             enabled=False,
@@ -47,8 +46,8 @@ class RemotePlugin:
             tool_name="remote_reconnect",
             tool_func=remote_reconnect,
             description=(
-                "Reconnect to the remote machine using cached connection "
-                "parameters. Use when the previous SSH connection was lost."
+                "使用缓存的连接参数重连远端机器。"
+                "适用于之前的 SSH 连接已断开的情况。"
             ),
             icon="🔄",
             enabled=False,
@@ -56,14 +55,14 @@ class RemotePlugin:
         api.register_tool(
             tool_name="remote_disconnect",
             tool_func=remote_disconnect,
-            description="Disconnect from the current remote SSH session.",
+            description="断开当前会话的远程 SSH 连接。",
             icon="🔌",
             enabled=False,
         )
         api.register_tool(
             tool_name="remote_list",
             tool_func=remote_list,
-            description="Show the current remote SSH connection status.",
+            description="查看当前会话的远程 SSH 连接状态。",
             icon="☁️",
             enabled=False,
         )
@@ -71,7 +70,7 @@ class RemotePlugin:
             tool_name="remote_exec",
             tool_func=remote_exec,
             description=(
-                "Explicitly execute a command on the remote machine via SSH."
+                "通过 SSH 在远端机器上显式执行一条命令。"
             ),
             icon="💻",
             enabled=False,
@@ -80,9 +79,8 @@ class RemotePlugin:
             tool_name="remote_info",
             tool_func=remote_info,
             description=(
-                "Show detailed information about the remote machine: "
-                "OS, architecture, kernel, shell, CPU, memory, disk, "
-                "and available development tools."
+                "查看远端机器的详细信息：系统、架构、内核、shell、"
+                "CPU、内存、磁盘以及可用的开发工具。"
             ),
             icon="ℹ️",
             enabled=False,
@@ -91,8 +89,8 @@ class RemotePlugin:
             tool_name="remote_health",
             tool_func=remote_health,
             description=(
-                "Check the health status of the current remote SSH "
-                "connection: status, latency, failures, reconnect availability."
+                "检查当前远程 SSH 连接的健康状态：连接状态、延迟、"
+                "失败次数、是否可重连。"
             ),
             icon="❤️",
             enabled=False,
@@ -101,8 +99,8 @@ class RemotePlugin:
             tool_name="remote_set_cwd",
             tool_func=remote_set_cwd,
             description=(
-                "Set the default remote working directory for this session. "
-                "All subsequent commands will execute in this directory."
+                "设置当前会话的默认远程工作目录，"
+                "之后所有命令都将在该目录下执行。"
             ),
             icon="📁",
             enabled=False,
@@ -111,8 +109,8 @@ class RemotePlugin:
             tool_name="remote_sudo",
             tool_func=remote_sudo,
             description=(
-                "Execute a command with sudo privileges on the remote machine. "
-                "Requires a configured sudo password (POSIX remotes only)."
+                "在远端机器上以 sudo 权限执行命令。"
+                "需要预先配置 sudo 密码（仅 POSIX 远端支持）。"
             ),
             icon="🛡️",
             enabled=False,

@@ -1,9 +1,9 @@
 {
   "id": "remote",
   "name": "Remote SSH",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "type": "general",
-  "description": "SSH into remote devices and execute shell commands transparently on remote machines.",
+  "description": "通过 SSH 连接远端设备，把本会话中的 shell 命令透明地转发到远端机器上执行（支持 POSIX 与 Windows）。",
   "author": "AlpacaKnight, CuNeCl",
   "entry": {
     "frontend": "ui/dist/index.js",
@@ -20,61 +20,61 @@
     "commands": [
       {
         "name": "/remote",
-        "description": "Manage the current remote SSH session and execute commands on the remote machine."
+        "description": "管理当前会话的远程 SSH 连接，并在远端机器上执行命令。"
       }
     ],
     "tools": [
       {
         "name": "remote_connect",
-        "description": "Connect to a remote device via SSH. After connecting, all shell commands in this conversation will execute on the remote machine.",
+        "description": "通过 SSH 连接远端设备。连接后，本会话内的所有 shell 命令都会在远端机器上执行。",
         "icon": "🔗",
         "config_fields": []
       },
       {
         "name": "remote_reconnect",
-        "description": "Reconnect to the remote machine using cached connection parameters. Use when the previous SSH connection was lost.",
+        "description": "使用缓存的连接参数重连远端机器。适用于之前的 SSH 连接已断开的情况。",
         "icon": "🔄",
         "config_fields": []
       },
       {
         "name": "remote_disconnect",
-        "description": "Disconnect from the current remote SSH session.",
+        "description": "断开当前会话的远程 SSH 连接。",
         "icon": "🔌",
         "config_fields": []
       },
       {
         "name": "remote_list",
-        "description": "Show the current remote SSH connection status.",
+        "description": "查看当前会话的远程 SSH 连接状态。",
         "icon": "☁️",
         "config_fields": []
       },
       {
         "name": "remote_exec",
-        "description": "Explicitly execute a command on the remote machine via SSH.",
+        "description": "通过 SSH 在远端机器上显式执行一条命令。",
         "icon": "💻",
         "config_fields": []
       },
       {
         "name": "remote_info",
-        "description": "Show detailed information about the remote machine: OS, architecture, kernel, shell, CPU, memory, disk, and available development tools.",
+        "description": "查看远端机器的详细信息：系统、架构、内核、shell、CPU、内存、磁盘以及可用的开发工具。",
         "icon": "ℹ️",
         "config_fields": []
       },
       {
         "name": "remote_health",
-        "description": "Check the health status of the current remote SSH connection: status, latency, failures, reconnect availability.",
+        "description": "检查当前远程 SSH 连接的健康状态：连接状态、延迟、失败次数、是否可重连。",
         "icon": "❤️",
         "config_fields": []
       },
       {
         "name": "remote_set_cwd",
-        "description": "Set the default remote working directory for this session. All subsequent commands will execute in this directory.",
+        "description": "设置当前会话的默认远程工作目录，之后所有命令都将在该目录下执行。",
         "icon": "📁",
         "config_fields": []
       },
       {
         "name": "remote_sudo",
-        "description": "Execute a command with sudo privileges on the remote machine. Requires a configured sudo password (POSIX remotes only).",
+        "description": "在远端机器上以 sudo 权限执行命令。需要预先配置 sudo 密码（仅 POSIX 远端支持）。",
         "icon": "🛡️",
         "config_fields": []
       }

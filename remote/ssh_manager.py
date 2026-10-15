@@ -249,8 +249,17 @@ def _open_jump_socket(
 def _probe_remote_platform(
     client: Any,
     timeout: float = 15.0,
+    preferred_shell: str = "",
 ) -> tuple[str, str, str]:
-    """Detect ``(os_family, shell, os_name)`` over an open client."""
+    """Detect ``(os_family, shell, os_name)`` over an open client.
+
+    ``preferred_shell`` is a user-pinned shell executable. When set it wins
+    outright and the Windows ``echo %COMSPEC%`` probe is skipped. When empty,
+    the shell falls back to the detected ``$SHELL`` and finally to the
+    platform default (``/bin/sh`` on POSIX, ``cmd.exe`` on Windows).
+    """
+    pinned = str(preferred_shell or "").strip()
+
     try:
         returncode, stdout, _stderr, timed_out = _run_on_client(
             client, remote_platform.PLATFORM_PROBE_COMMAND, timeout
@@ -259,16 +268,29 @@ def _probe_remote_platform(
         logger.warning(
             "[Remote] Platform probe failed (%s); assuming POSIX remote", exc
         )
-        return remote_platform.POSIX, "", ""
+        return (
+            remote_platform.POSIX,
+            pinned or remote_platform.POSIX_DEFAULT_SHELL,
+            "",
+        )
 
-    os_family, shell, os_name = remote_platform.parse_platform_probe(
+    os_family, detected_shell, os_name = remote_platform.parse_platform_probe(
         -1 if timed_out else returncode, stdout
     )
+
     if os_family == remote_platform.POSIX:
-        return os_family, shell, os_name
+        return (
+            os_family,
+            pinned or detected_shell or remote_platform.POSIX_DEFAULT_SHELL,
+            os_name,
+        )
+
+    if pinned:
+        # Caller explicitly chose a shell; skip the differential probe.
+        return remote_platform.WINDOWS, pinned, "Windows"
 
     # Windows: the login shell decides the command grammar.
-    shell = remote_platform.SHELL_CMD
+    shell = remote_platform.WINDOWS_DEFAULT_SHELL
     try:
         _rc, shell_out, _err, _to = _run_on_client(
             client, remote_platform.WINDOWS_SHELL_PROBE_COMMAND, timeout
@@ -458,8 +480,14 @@ class SSHManager:
         jump_passphrase: str = "",
         accept_new_host_key: bool = False,
         owner: str = "",
+        shell: str = "",
     ) -> dict:
         """Establish an SSH connection and store it for the session.
+
+        ``shell`` pins the shell executable that decides the command grammar
+        (for example ``/bin/zsh``, ``powershell.exe``, ``cmd.exe`` or a Git
+        Bash path). Empty falls back to the detected ``$SHELL`` and then to
+        the platform default (``/bin/sh`` on POSIX, ``cmd.exe`` on Windows).
 
         Returns connection info dict on success.
         Raises on failure with a clear error message.
@@ -569,8 +597,8 @@ class SSHManager:
 
         # Platform detection must happen before any command is wrapped so the
         # first user command already uses the right grammar.
-        os_family, shell, os_name = await asyncio.to_thread(
-            _probe_remote_platform, client
+        os_family, resolved_shell, os_name = await asyncio.to_thread(
+            _probe_remote_platform, client, 15.0, shell
         )
 
         info = SSHConnectionInfo(
@@ -589,7 +617,7 @@ class SSHManager:
             os_family=os_family,
             accept_new_host_key=accept_new_host_key,
             remote_os=os_name,
-            remote_shell=shell,
+            remote_shell=resolved_shell,
             _connect_params={
                 "host": host,
                 "port": port,
@@ -608,6 +636,7 @@ class SSHManager:
                 "jump_password": jump_config.get("password", "") if jump_config else "",
                 "jump_key_path": jump_config.get("key_path", "") if jump_config else "",
                 "jump_passphrase": jump_config.get("passphrase", "") if jump_config else "",
+                "shell": shell,
             },
         )
 
@@ -1385,8 +1414,13 @@ class SSHManager:
         jump_key_path: str = "",
         jump_passphrase: str = "",
         accept_new_host_key: bool = False,
+        shell: str = "",
     ) -> dict:
         """Test an SSH connection without affecting current sessions.
+
+        ``shell`` pins the shell executable that decides the command grammar;
+        empty falls back to the detected ``$SHELL`` and then to the platform
+        default (``/bin/sh`` on POSIX, ``cmd.exe`` on Windows).
 
         Returns dict with latency_ms, os_family, remote_os and remote_shell
         on success. Raises on failure.
@@ -1438,14 +1472,14 @@ class SSHManager:
                 latency_ms = round((time.monotonic() - start) * 1000, 1)
                 if accept_new_host_key:
                     _remember_client_host_key(client, host, port)
-                os_family, shell, os_name = _probe_remote_platform(
-                    client, timeout=10
+                os_family, resolved_shell, os_name = _probe_remote_platform(
+                    client, timeout=10, preferred_shell=shell
                 )
                 return {
                     "latency_ms": latency_ms,
                     "os_family": os_family,
                     "remote_os": os_name,
-                    "remote_shell": shell,
+                    "remote_shell": resolved_shell,
                 }
             finally:
                 client.close()

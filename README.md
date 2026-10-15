@@ -28,6 +28,7 @@ Remote SSH 是一个 QwenPaw 插件，用于给当前聊天会话建立 SSH 连�
 - 连接健康监控：自动心跳检测连接状态，断线后可一键重连。
 - Profile 测试连接：保存或使用连接配置前，可验证 SSH 参数是否正确。
 - POSIX / Windows 双平台：自动探测远端系统类型与登录 shell，并按平台生成对应的命令包装、工作目录切换与环境探测脚本。
+- Shell 可执行程序可指定：可固定远端命令使用的 shell（如 `/bin/bash`、`/bin/zsh`、`powershell.exe`、`pwsh.exe`、Git Bash），留空则自动探测（`$SHELL` → 平台默认值）。
 - 中英文双语界面：跟随宿主语言设置自动切换。
 
 > 工具默认处于未启用状态。首次使用前请在 Agent 工具管理中启用所需的 `remote_*` 工具，否则模型无法调用它们。
@@ -56,6 +57,8 @@ Remote SSH 是一个 QwenPaw 插件，用于给当前聊天会话建立 SSH 连�
 连接状态下，连接选项下方会显示当前默认工作目录，并可通过编辑按钮修改（只更新该 profile 的工作目录字段，其它配置保持不变）。
 
 编辑连接配置时，密码、密钥口令和 sudo 密码字段旁会显示"已设置"标记，提示该字段已有保存的值。留空提交则保留原有值。
+
+「Shell 可执行程序」输入框用于固定远端命令使用的 shell 语法：可填 `/bin/bash`、`/bin/zsh`、`powershell.exe`、`pwsh.exe` 或 Git Bash 等路径（提供预设可选，也可自由输入），留空表示自动探测——先取远端 `$SHELL`，再回退到平台默认值（Unix `/bin/sh`，Windows `cmd.exe`）。注意：所选 shell 需与远端登录 shell 一致，否则命令语法不匹配会导致执行失败。
 
 新建对话在发出第一条消息前还没有会话 ID：此时打开连接开关会先把该配置记为「待连接」（连接选项显示「待连接」标签），等该对话发出第一条消息时自动建立连接。
 
@@ -100,6 +103,12 @@ Web 端 header 中的 SSH 状态按钮会显示当前会话是否已连接，并
 ```
 
 信任首次连接的未知主机密钥（请先核对指纹）。
+
+```text
+/remote connect root@192.168.0.106 shell=/bin/zsh
+```
+
+固定远端命令使用的 shell（决定命令语法），可填 `/bin/zsh`、`powershell.exe`、Git Bash 路径等；不指定（或留空）则自动探测（`$SHELL` → 平台默认值）。
 
 ```text
 /remote pwd
@@ -168,6 +177,7 @@ Web 端 header 中的 SSH 状态按钮会显示当前会话是否已连接，并
 - 工作目录以 `~` 开头时按 `$HOME` 展开（POSIX）。
 - Windows 远端的环境探测由 PowerShell 或 cmd 脚本完成，因此部分字段（如内存）在 cmd 下可能为空。
 - 在 Windows 远端执行 `remote_sudo` 会返回明确错误，请在远端自行以管理员身份执行。
+- 远端 shell 可以固定：在连接配置中设置 `default_shell`，或用 `remote_connect(shell="/bin/zsh")`、`/remote connect ... shell=powershell.exe`。指定后跳过 Windows 的 `echo %COMSPEC%` 探测，直接按所选 shell 的语法生成命令；留空（默认）则保持上表的自动探测行为。**注意**：该设置只决定命令包装语法，不会显式调用该程序——所选 shell 必须与远端登录 shell 一致，否则语法不匹配会导致命令执行失败。
 
 ## 安装
 
@@ -217,7 +227,7 @@ QwenPaw Web 端会按 `plugin.json` 的 `entry.frontend` 加载前端 bundle。`
 
 ```json
 {
-	"version": "0.3.0",
+	"version": "0.3.2",
 	"entry": {
 		"frontend": "ui/dist/index.js"
 	}
@@ -226,7 +236,7 @@ QwenPaw Web 端会按 `plugin.json` 的 `entry.frontend` 加载前端 bundle。`
 
 打包脚本会校验这个一致性；如果 `entry.frontend` 被改成其他路径，打包会失败。
 
-插件包内的 `plugin.json` 始终使用裸路径，不包含版本号。浏览器缓存由 **QwenPaw Web 宿主**负责（在加载插件前端时按插件版本追加 cache-busting 参数，例如把 `ui/dist/index.js` 加载为 `ui/dist/index.js?v=0.3.0`）。如果浏览器页面仍显示旧 UI，先完整刷新页面；必要时重启 QwenPaw Web 服务或清理浏览器缓存。
+插件包内的 `plugin.json` 始终使用裸路径，不包含版本号。浏览器缓存由 **QwenPaw Web 宿主**负责（在加载插件前端时按插件版本追加 cache-busting 参数，例如把 `ui/dist/index.js` 加载为 `ui/dist/index.js?v=0.3.2`）。如果浏览器页面仍显示旧 UI，先完整刷新页面；必要时重启 QwenPaw Web 服务或清理浏览器缓存。
 
 如果本机已经安装过前端依赖，可以跳过 `npm ci`：
 
@@ -289,8 +299,8 @@ python -m pytest tests -q
 如果 QwenPaw 运行在 Docker 中，插件目录通常位于容器内的 `/app/working/plugins`。可以把打包后的 ZIP 复制进容器，再使用容器内的 QwenPaw CLI 强制安装：
 
 ```bash
-docker cp dist/qwenpaw-remote-plugin-0.3.0.zip copaw:/tmp/qwenpaw-remote-plugin-0.3.0.zip
-docker exec copaw sh -lc '/app/venv/bin/qwenpaw plugin install /tmp/qwenpaw-remote-plugin-0.3.0.zip --force'
+docker cp dist/qwenpaw-remote-plugin-0.3.2.zip copaw:/tmp/qwenpaw-remote-plugin-0.3.2.zip
+docker exec copaw sh -lc '/app/venv/bin/qwenpaw plugin install /tmp/qwenpaw-remote-plugin-0.3.2.zip --force'
 ```
 
 安装后可以检查 Web 端暴露的插件清单：
@@ -328,6 +338,8 @@ curl -sS http://127.0.0.1:8088/api/frontend_plugin
 | PUT/DELETE | `/api/remote/jump-hosts/{jump_host_id}` | 更新 / 删除跳板机 |
 
 `profiles` 与 `jump-hosts` 属于宿主级配置，不与会话绑定；`connections/*` 属于会话级资源，会校验调用方主体。
+
+连接配置新增 `default_shell` 字段（shell 可执行程序路径，空值表示自动探测）；`POST /connections`、`POST /profiles/test`、`POST /profiles/{id}/test` 也接受 `shell` 入参，用于固定远端命令使用的 shell。
 
 ## 维护者
 

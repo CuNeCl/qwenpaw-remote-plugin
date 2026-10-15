@@ -376,6 +376,7 @@ async def connect_profile(profile_id: str, body: dict, request: Request):
         profile_id=profile_id,
         jump_host_id=jump_host_id,
         accept_new_host_key=accept_new_host_key,
+        shell=str(profile.get("default_shell", "")),
     )
 
     if not session_id:
@@ -460,6 +461,7 @@ async def create_connection(req: ConnectRequest, request: Request):
             jump_passphrase=req.jump_passphrase,
             accept_new_host_key=req.accept_new_host_key,
             owner=_caller_subject(request),
+            shell=req.shell,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -672,6 +674,7 @@ async def test_profile_connection(req: ProfileTestRequest, request: Request):
             jump_key_path=req.jump_key_path,
             jump_passphrase=req.jump_passphrase,
             accept_new_host_key=req.accept_new_host_key,
+            shell=req.shell,
         )
     except (ConnectionError, ValueError) as e:
         return {"ok": False, "error": str(e)}
@@ -709,6 +712,7 @@ async def test_saved_profile(profile_id: str, request: Request):
             passphrase=str(profile.get("passphrase", "")),
             jump_host_id=jump_host_id,
             accept_new_host_key=bool(profile.get("accept_new_host_key", False)),
+            shell=str(profile.get("default_shell", "")),
         )
     except (ConnectionError, ValueError) as e:
         return {"ok": False, "error": str(e)}

@@ -31,6 +31,7 @@ PROFILE_PAYLOAD = {
     "sudo_password": "sudopass",
     "jump_host_id": "jump-1",
     "default_cwd": "/srv/app",
+    "default_shell": "powershell.exe",
     "accept_new_host_key": True,
 }
 
@@ -40,6 +41,7 @@ def test_create_and_list_profile(store):
     assert created["host"] == "10.0.0.12"
     assert created["accept_new_host_key"] is True
     assert created["sudo_password"] == "sudopass"
+    assert created["default_shell"] == "powershell.exe"
 
     listed = store.list_profiles()
     assert len(listed) == 1
@@ -64,6 +66,7 @@ def test_update_profile_cwd_preserves_every_other_field(store):
     assert updated["passphrase"] == "keypass"
     assert updated["sudo_password"] == "sudopass"
     assert updated["accept_new_host_key"] is True
+    assert updated["default_shell"] == "powershell.exe"
 
     persisted = store.list_profiles()[0]
     assert persisted == updated
