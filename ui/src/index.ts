@@ -318,6 +318,30 @@ function buildPlugin() {
   }
 
   /**
+   * Whether a saved profile is the device of the currently active connection.
+   *
+   * A connection opened from a profile carries that profile's id, which is
+   * authoritative. Connections opened from chat (`remote_connect` or
+   * `/remote connect`) have no profile id at all, so fall back to matching the
+   * endpoint — without it the saved device keeps showing "Connect" while the
+   * header already reports an active SSH connection on that very device.
+   */
+  function profileMatchesConnection(
+    profile: any,
+    connection: any,
+    activeProfileId: string,
+  ): boolean {
+    if (!profile || !connection) return false;
+    if (activeProfileId) return profile.id === activeProfileId;
+    const norm = (value: any) => String(value ?? "").trim().toLowerCase();
+    return (
+      norm(profile.username) === norm(connection.username) &&
+      norm(profile.host) === norm(connection.host) &&
+      Number(profile.port || 22) === Number(connection.port || 22)
+    );
+  }
+
+  /**
    * Connect through a saved profile.
    *
    * On an untrusted host key the offer to trust it once is shown and the
@@ -774,6 +798,7 @@ function buildPlugin() {
     const [profiles, setProfiles] = useState([] as any[]);
     const [jumpHosts, setJumpHosts] = useState([] as any[]);
     const [activeProfileId, setActiveProfileId] = useState("");
+    const [activeConnection, setActiveConnection] = useState(null as any);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
     const [modalOpen, setModalOpen] = useState(false);
@@ -813,6 +838,7 @@ function buildPlugin() {
         );
         setProfiles(profileData.profiles || []);
         setActiveProfileId(activeConnection?.profile_id || "");
+        setActiveConnection(activeConnection);
         setPendingProfileId(active?.pending_profile_id || "");
         setJumpHosts(jumpHostData.jump_hosts || []);
         setCwdValue(activeConnection?.default_cwd || "/");
@@ -1036,7 +1062,12 @@ function buildPlugin() {
       }
     };
 
-    const isConnected = (profileId: string) => profileId === activeProfileId;
+    const isConnected = (profileId: string) =>
+      profileMatchesConnection(
+        profiles.find((profile: any) => profile.id === profileId),
+        activeConnection,
+        activeProfileId,
+      );
 
     return React.createElement(
       "div",
@@ -1825,7 +1856,11 @@ function buildPlugin() {
       const activeSessionId = requireSessionId(zh, sessionId);
       if (!activeSessionId) return;
 
-      const isActive = profile.id === activeProfileId;
+      const isActive = profileMatchesConnection(
+        profile,
+        connection,
+        activeProfileId,
+      );
       setConnectingId(profile.id);
       try {
         if (isActive) {
@@ -2011,7 +2046,11 @@ function buildPlugin() {
               Space,
               { direction: "vertical", size: 6, style: { width: "100%" } },
               ...profiles.map((profile: any) => {
-                const active = profile.id === activeProfileId;
+                const active = profileMatchesConnection(
+                  profile,
+                  connection,
+                  activeProfileId,
+                );
                 return React.createElement(
                   "div",
                   {

@@ -73,6 +73,7 @@ tests/                 → 回归测试（platform、store、host key、pending 
 - 跳板机连接会创建嵌套 transport 链；必须按正确顺序断开（由 `SSHManager.disconnect()` 管理）。
 - `PUT /profiles/{id}` 是**全量替换**语义：局部字段修改必须走专用函数（如 `store.update_profile_cwd`），否则会把 host/username/key_path 重置为默认值。
 - `store._normalize_profile_payload` 按**固定字段逐个构造** profile：新增 profile 字段（如 `default_shell`）必须同步加进该函数，否则前端提交的值会被静默丢弃——接口返回正常但功能不生效。
+- 「已保存设备」的连接态**不能**只用 `profile.id === connection.profile_id` 判定：对话里通过 `remote_connect` / `/remote connect` 建立的连接不带 `profile_id`，必须回退到 `用户名@主机:端口` 端点匹配（`ui/src/index.ts` 的 `profileMatchesConnection()`），否则会出现「header 显示已连接、设备列表却仍显示 Connect」的错位。设置页与 header 弹层共用该函数。
 - 未知主机密钥默认 `RejectPolicy` 拒绝。显式信任（profile 开关 / `remote_connect(accept_new_host_key=True)` / `/remote connect accept_new_host_key=true` / 前端「信任并重试」）会通过 `_remember_host_key` **一次性写入 `WORKING_DIR/remote/known_hosts`**（TOFU），之后连接照常严格校验；密钥不一致时抛 `BadHostKeyException` → `_host_key_mismatch_message`，**绝不允许自动信任**。`_load_known_hosts` 同时加载系统/用户/插件三处 known_hosts。
 - sudo 密码来自 profile 的 `sudo_password` 或会话级配置接口，**不要**回退到 SSH 登录密码。Windows 远端不支持 sudo。
 - 会话级 API 会校验调用方主体（`X-Agent-Id` / `X-User-Id`）；新增会话级路由时需调用 `_assert_session_owner`。

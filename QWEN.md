@@ -121,6 +121,7 @@ python -m pytest tests -q
 - **敏感字段处理：** 响应中必须移除 `password` / `passphrase` / `sudo_password`（`_sanitize_secret_fields`）
 - **配置持久化：** 存储到 `WORKING_DIR/remote/profiles.json`，原子写入；更新时保留未提供的敏感字段
 - **profile 字段白名单：** `store._normalize_profile_payload` 逐字段构造 profile，新增字段（如 `default_shell`）必须显式加入，否则提交的值会被静默丢弃
+- **设备连接态判定：** 「已保存设备」不能只用 `profile.id === connection.profile_id`——对话里建立的连接不带 `profile_id`，必须回退到 `用户名@主机:端口` 端点匹配（`ui/src/index.ts` 的 `profileMatchesConnection()`），否则会出现「header 已连接但设备仍显示 Connect」
 - **profile 更新语义：** `PUT /profiles/{id}` 是全量替换；局部修改必须走专用函数（如 `update_profile_cwd`），不要把增量 payload 交给 `update_profile`
 - **前端请求约定：** 不要用 `host.fetch`（部分宿主版本会忽略 `options.method`，把 POST/PATCH 静默变成 GET）；统一走 `apiFetch()`，用 `host.getApiUrl()` + 原生 `fetch` 显式传 method，并补 `Authorization` / `X-Agent-Id` 头
 - **session id 约定：** `getSessionId()` 返回 `string | null`，按宿主 API → 全局变量 → `chat.requestPayload` 回调缓存 → `/connections/active` 探测的顺序解析；不得使用共享兜底 id（会造成跨会话串号）。轮询路径静默处理，只有用户主动操作才提示
