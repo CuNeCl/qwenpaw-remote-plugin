@@ -49,18 +49,19 @@ ui/src/index.ts (单文件 React 前端，通过 window.QwenPaw.* 注册路由/�
 
 ### Features
 
-- 密码 / SSH 私钥认证，主机密钥默认严格校验（可按连接开启信任未知主机）
+- 密码 / SSH 私钥认证，主机密钥默认严格校验（TOFU：显式信任后写入插件 known_hosts 持久生效）
 - 跳板机（Jump Host）支持
 - 连接配置持久化（Profiles），sudo 密码独立于 SSH 密码
 - 透明 shell 命令转发；连接失效时阻断本地执行
 - POSIX / Windows 远端自动探测与平台适配
 - `/remote` 对话命令
-- 前端连接管理页面
-- 会话归属校验（基于宿主注入的身份头）
+- 前端连接管理页面与 header 状态浮层
+- 会话归属校验（基于宿主注入的身份头）；`/connections/active` 按调用方主体解析活跃连接
+- 新对话延迟连接：发出第一条消息前点击连接会记为 pending，首条消息时自动兑现
 
 ### Security Behaviors
 
-- 未知主机密钥默认被 `RejectPolicy` 拒绝，需显式开启 `accept_new_host_key`。
+- 未知主机密钥默认被 `RejectPolicy` 拒绝。显式信任（profile 开关 / `accept_new_host_key` / 前端「信任并重试」）会一次性写入 `WORKING_DIR/remote/known_hosts`（TOFU），之后仍严格校验；密钥不一致时拒绝连接并提示人工核对，绝不自动信任。`known_hosts` 同时加载系统/用户/插件三处。
 - `profiles.json` 明文保存密码/口令，写入时尽量设置 `0600`。
 - 会话级接口校验调用方主体；无身份头时退化为单用户放行。
 - 连接失效且存在缓存参数时，`execute_shell_command` 被阻断而非回退本地。
@@ -108,7 +109,7 @@ chmod +x scripts/package.sh
 python -m pytest tests -q
 ```
 
-`tests/` 只覆盖纯逻辑（平台命令包装、profile 增量更新、存储写入），需要额外安装 `pytest`。
+`tests/` 只覆盖纯逻辑（平台命令包装与探测、profile 增量更新、存储原子写入、REST 路由解析、主机密钥信任、待连接与活跃连接解析），需要额外安装 `pytest`。
 
 ## Development Conventions
 
@@ -119,3 +120,6 @@ python -m pytest tests -q
 - **敏感字段处理：** 响应中必须移除 `password` / `passphrase` / `sudo_password`（`_sanitize_secret_fields`）
 - **配置持久化：** 存储到 `WORKING_DIR/remote/profiles.json`，原子写入；更新时保留未提供的敏感字段
 - **profile 更新语义：** `PUT /profiles/{id}` 是全量替换；局部修改必须走专用函数（如 `update_profile_cwd`），不要把增量 payload 交给 `update_profile`
+- **前端请求约定：** 不要用 `host.fetch`（部分宿主版本会忽略 `options.method`，把 POST/PATCH 静默变成 GET）；统一走 `apiFetch()`，用 `host.getApiUrl()` + 原生 `fetch` 显式传 method，并补 `Authorization` / `X-Agent-Id` 头
+- **session id 约定：** `getSessionId()` 返回 `string | null`，按宿主 API → 全局变量 → `chat.requestPayload` 回调缓存 → `/connections/active` 探测的顺序解析；不得使用共享兜底 id（会造成跨会话串号）。轮询路径静默处理，只有用户主动操作才提示
+- **会话级路由：** 新增会话级路由必须调用 `_assert_session_owner` 校验调用方主体

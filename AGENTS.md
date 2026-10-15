@@ -15,6 +15,8 @@ QwenPaw 2.0+ 插件，为聊天会话提供透明的 SSH 远程执行能力。�
 | 运行测试 | `python -m pytest tests -q` |
 | 打包 ZIP | `./scripts/package.sh` |
 | 打包（跳过 npm ci） | `./scripts/package.sh --skip-install` |
+| 打包 ZIP（Windows） | `.\scripts\package.ps1` |
+| 打包（跳过 npm ci，Windows） | `.\scripts\package.ps1 -SkipInstall` |
 
 无 lint/格式化工具。
 
@@ -32,6 +34,7 @@ remote/store.py        → JSON 文件持久化（连接配置/跳板机，原�
 remote/routers/        → FastAPI REST API 和请求 schema（挂载在 /api/remote）
 remote/tools/          → 工具实现（connect、disconnect、list、exec、/remote 命令）
 ui/src/index.ts        → 单文件 React 前端（无 JSX，直接用 createElement）
+tests/                 → 回归测试（platform、store、host key、pending connect、routes、active connection）
 ```
 
 ## 核心模式
