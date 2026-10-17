@@ -1911,30 +1911,25 @@ function buildPlugin() {
     const deviceArch = remoteInfo?.remote_arch || connection?.remote_arch || "";
     const deviceShell = remoteInfo?.remote_shell || connection?.remote_shell || "";
     const deviceSummary = [deviceOs, deviceArch, deviceShell].filter(Boolean).join(" · ");
-    const shortDeviceLabel = [deviceOs, deviceArch].filter(Boolean).join(" ");
 
+    // Render the trigger with the host's own Button so it inherits QwenPaw's
+    // styling instead of standing out as a hand-styled chip. A text button with
+    // a small status dot reads quietly next to the surrounding chrome; the
+    // endpoint, uptime and OS details stay in the popover.
     const trigger = React.createElement(
-      "button",
+      Button,
       {
         id: "remote-ssh-header-status-react",
-        type: "button",
+        type: "text",
+        size: "small",
         style: {
-          height: 38,
-          minWidth: 156,
-          maxWidth: 220,
-          padding: "0 12px",
+          maxWidth: 240,
+          paddingInline: 6,
           display: "inline-flex",
           alignItems: "center",
-          justifyContent: "center",
-          gap: 8,
-          border: `1px solid ${isConnected ? theme.successBorder : theme.border}`,
-          borderRadius: 6,
-          background: isConnected ? theme.successBg : theme.bgContainer,
-          color: isConnected ? theme.success : theme.text,
-          font: "inherit",
-          cursor: "pointer",
-          whiteSpace: "nowrap",
-          overflow: "hidden",
+          gap: 6,
+          fontWeight: 400,
+          color: isConnected ? undefined : theme.secondaryText,
         },
         "aria-label": isConnected
           ? `SSH connected to ${connection.username}@${connection.host}`
@@ -1950,31 +1945,19 @@ function buildPlugin() {
             minWidth: 0,
             overflow: "hidden",
             textOverflow: "ellipsis",
-            fontSize: 14,
-            fontWeight: 600,
+            whiteSpace: "nowrap",
           },
         },
         isConnected
           ? `${connection.username}@${connection.host}`
           : loading
-            ? "SSH Checking"
-            : "SSH Offline",
+            ? zh
+              ? "SSH 检测中"
+              : "SSH Checking"
+            : zh
+              ? "SSH 未连接"
+              : "SSH Offline",
       ),
-      isConnected && shortDeviceLabel
-        ? React.createElement(
-            Tag,
-            {
-              color: "green",
-              style: {
-                marginInlineStart: 0,
-                maxWidth: 92,
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-              },
-            },
-            shortDeviceLabel,
-          )
-        : null,
     );
 
     const content = React.createElement(
@@ -2141,7 +2124,9 @@ function buildPlugin() {
       {
         content,
         trigger: "click",
-        placement: "bottom",
+        // Anchored to the right edge of its trigger: the control now lives in
+        // the header's right region, so a centred popover would overflow.
+        placement: "bottomRight",
       },
       React.createElement(Tooltip, {
         title: isConnected
@@ -2152,12 +2137,26 @@ function buildPlugin() {
   }
 
   function registerHeaderStatus() {
-    qwenpaw.slot.fill(
-      REMOTE_PLUGIN_ID,
-      "header.left",
-      () => React.createElement(RemoteStatusIndicator),
-      { id: "remote-ssh-status", order: 15 },
-    );
+    const statusNode = () => React.createElement(RemoteStatusIndicator);
+    const opts = { id: "remote-ssh-status", order: 5 };
+
+    // The chat header's action group (terminal / workspace buttons inside
+    // `qwenpaw-chat-anywhere-default-header-right`) is the natural home for
+    // this control: a small `order` puts it immediately left of the terminal
+    // action, so the status reads as part of the surrounding chrome instead of
+    // a lone chip in the navbar. `slot.header.right` targets the navbar, which
+    // is a different container.
+    try {
+      if (qwenpaw.chat?.rightHeader?.add) {
+        qwenpaw.chat.rightHeader.add(REMOTE_PLUGIN_ID, statusNode(), opts);
+        return;
+      }
+    } catch (e) {
+      console.debug("[Remote] chat header registration failed:", e);
+    }
+
+    // Fallback for host builds without the chat header API.
+    qwenpaw.slot.fill(REMOTE_PLUGIN_ID, "header.right", statusNode, opts);
   }
 
   // ── Register plugin ──────────────────────────────────────────────────
